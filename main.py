@@ -129,9 +129,6 @@ class Config:
     EXCHANGE_TRAILING_STOP_GAP = 0.05
 
 
-    # [NEW] Regime switch cooldown (sec) - 전환 직후 신규진입 금지
-    REGIME_SWITCH_COOLDOWN_SEC = 300
-
     # [NEW] Trailing Stop (Bybit) - ATR% 기반 자동 산출
     TS_ATR_TF = "15m"          # ATR 계산 TF
     TS_ATR_PERIOD = 14
@@ -896,8 +893,6 @@ class TechnicalAnalyzer:
 
 
     @staticmethod
-    
-    @staticmethod
     def _check_common_conditions_sync_long(dfs_common):
         """
         [LONG 공통조건]
@@ -1137,8 +1132,6 @@ class TechnicalAnalyzer:
         return bool(ok), str(msg or "")
 
     @staticmethod
-    
-    @staticmethod
     def _check_signals_sync(ohlcvs_dict, side: str = "long"):
         """
         엔트리 시그널 (5m)
@@ -1150,9 +1143,10 @@ class TechnicalAnalyzer:
             side = str(side or "long").lower().strip()
             df1 = ohlcvs_dict.get("1m")
             df5 = ohlcvs_dict.get("5m")
-            df15 = ohlcvs_dict.get("15m")
+            df15 = ohlcvs_dict.get("15m")  # 선택적: REQUIRE_ENTRY_BB_EXPAND 시에만 필수
 
-            if df1 is None or df5 is None or df15 is None:
+            # 1m/5m은 필수, 15m은 BB게이트 옵션이 켜진 경우만 필수
+            if df1 is None or df5 is None:
                 return False, False, 0.0, "", "", "", {}
 
             # 5m 지표
@@ -1203,6 +1197,8 @@ class TechnicalAnalyzer:
             # 15m BB 확장 게이트(둘 다 동일)
             # - 이미 공통에서 강제할 수 있으나, 엔트리에서도 한 번 더 게이트(옵션)
             if getattr(Config, "REQUIRE_ENTRY_BB_EXPAND", False):
+                if df15 is None:
+                    return False, full_exit, 0.0, "", "", "", details
                 ok15, _ = TechnicalAnalyzer._bb_shell_expand_1bar(df15)
                 if not ok15:
                     return False, full_exit, 0.0, "", "", "", details
@@ -1389,12 +1385,6 @@ class AsyncTradingBot:
 
         self.entry_strategy_map = {}  # key=(symbol,pos_idx) -> strategy_note
         self.bb_armed_map = {}  # key=(symbol,pos_idx) -> bool
-
-
-        # [NEW] Regime (long/short) + entry cooldown
-        self.regime_side = "long"  # "long" or "short"
-        self.regime_last_switch_ts = 0.0
-        self.regime_entry_block_until = 0.0
 
         # [NEW] Position meta for time-stop / trailing-stop arming
         # key=(symbol,pos_idx) -> dict(entry_ts, entry_price, best_price, best_profit_pct)
@@ -3725,10 +3715,6 @@ class AsyncTradingBot:
         if side not in ("long", "short"):
             side = "long"
 
-        # 레짐 전환 직후 신규진입 쿨다운
-        if time.time() < float(getattr(self, "regime_entry_block_until", 0.0) or 0.0):
-            return
-
         async with self._get_entry_lock(symbol):
             try:
                 # 이미 포지션 있으면 스킵(방향 무관)
@@ -3834,8 +3820,8 @@ class AsyncTradingBot:
         [NEW] 메인 루프
         1) 후보심볼(최대 100) 선정
         2) 후보 100개 대상으로 LONG/SHORT 공통조건을 동시에 평가 -> 레짐(롱/숏) 결정
-        3) 레짐 전환 시 5분간 신규진입 금지
-        4) 레짐에 해당하는 심볼만 엔트리 시그널 체크 후 진입
+        3) 심볼별 독립 방향 결정: long_ok → 롱, short_ok → 숏 (레짐 없음)
+        4) 엔트리 시그널 체크 후 진입
         """
         await asyncio.sleep(2)
         while self.is_running:
@@ -3865,11 +3851,9 @@ class AsyncTradingBot:
                 random.shuffle(sym_list)
 
                 # -------------------------
-                # 2) 공통조건 평가 (LONG/SHORT)
+                # 2) 공통조건 평가 (LONG/SHORT 동시, 심볼별 독립)
                 # -------------------------
                 common_map = {}  # symbol -> (long_ok, short_ok, msg_long, msg_short)
-                long_hits = 0
-                short_hits = 0
 
                 async def _eval_common_one(sym):
                     try:
@@ -3893,10 +3877,6 @@ class AsyncTradingBot:
                                 continue
                             sym, tup = r
                             common_map[sym] = tup
-                            if tup[0]:
-                                long_hits += 1
-                            if tup[1]:
-                                short_hits += 1
                         batch = []
 
                 if batch:
@@ -3907,62 +3887,54 @@ class AsyncTradingBot:
                             continue
                         sym, tup = r
                         common_map[sym] = tup
-                        if tup[0]:
-                            long_hits += 1
-                        if tup[1]:
-                            short_hits += 1
 
                 # -------------------------
-                # 3) 레짐 결정/전환
+                # 3) 심볼별 독립 방향 결정
+                # - long_ok만 → 롱 진입 후보
+                # - short_ok만 → 숏 진입 후보 (ENABLE_SHORT=True일 때)
+                # - 둘 다 or 둘 다 아님 → 스킵 (신호 불명확)
                 # -------------------------
-                desired = "long" if (long_hits >= short_hits) else "short"
-                now = time.time()
-
-                if desired != self.regime_side:
-                    cooldown = float(getattr(Config, "REGIME_SWITCH_COOLDOWN_SEC", 300) or 300)
-                    if (now - float(self.regime_last_switch_ts or 0.0)) >= cooldown:
-                        self.regime_side = desired
-                        self.regime_last_switch_ts = now
-                        self.regime_entry_block_until = now + cooldown
-                        self.queue_notify(
-                            f"[REGIME_SWITCH] -> {desired.upper()} | long_hits={long_hits} short_hits={short_hits} | "
-                            f"cooldown={int(cooldown)}s"
-                        )
-
-                # 전환 직후 신규진입 금지
-                if now < float(self.regime_entry_block_until or 0.0):
-                    await asyncio.sleep(Config.MAIN_LOOP_SEC)
-                    continue
-
-                # -------------------------
-                # 4) 레짐에 해당하는 심볼만 엔트리 검사
-                # -------------------------
-                side = self.regime_side
-                if side == "short" and not getattr(Config, "ENABLE_SHORT", True):
-                    side = "long"
-
-                eligible = []
+                enable_short = bool(getattr(Config, "ENABLE_SHORT", True))
+                # (sym, msg, side) 형태로 구성
+                ent_candidates = []
+                long_cnt = 0
+                short_cnt = 0
                 for sym, (l_ok, s_ok, l_msg, s_msg) in common_map.items():
-                    if side == "long" and l_ok:
-                        eligible.append((sym, l_msg))
-                    elif side == "short" and s_ok:
-                        eligible.append((sym, s_msg))
+                    if l_ok and not s_ok:
+                        ent_candidates.append((sym, l_msg, "long"))
+                        long_cnt += 1
+                    elif s_ok and not l_ok and enable_short:
+                        ent_candidates.append((sym, s_msg, "short"))
+                        short_cnt += 1
+                    # 둘 다 True거나 둘 다 False면 스킵
 
-                if not eligible:
+                if not ent_candidates:
                     await asyncio.sleep(Config.MAIN_LOOP_SEC)
                     continue
 
-                # 엔트리 체크는 배치로
+                # 텔레그램에 현재 루프 요약 알림 (너무 자주 보내지 않도록 10루프마다)
+                if not hasattr(self, "_loop_cnt"):
+                    self._loop_cnt = 0
+                self._loop_cnt += 1
+                if self._loop_cnt % 10 == 1:
+                    self.queue_notify(
+                        f"[SCAN] long_cand={long_cnt} short_cand={short_cnt} "
+                        f"total={len(ent_candidates)}/{len(sym_list)}"
+                    )
+
+                # -------------------------
+                # 4) 엔트리 시그널 체크 (배치)
+                # -------------------------
                 ent_batch = []
-                for sym, msg in eligible:
-                    ent_batch.append((sym, msg))
+                for sym, msg, side in ent_candidates:
+                    ent_batch.append((sym, msg, side))
                     if len(ent_batch) >= int(getattr(Config, "MAIN_BATCH_SIZE", 10) or 10):
-                        tasks = [self.process_symbol(x, total_bal, side=side, common_msg=m) for x, m in ent_batch]
+                        tasks = [self.process_symbol(x, total_bal, side=sd, common_msg=m) for x, m, sd in ent_batch]
                         await asyncio.gather(*tasks, return_exceptions=True)
                         ent_batch = []
 
                 if ent_batch:
-                    tasks = [self.process_symbol(x, total_bal, side=side, common_msg=m) for x, m in ent_batch]
+                    tasks = [self.process_symbol(x, total_bal, side=sd, common_msg=m) for x, m, sd in ent_batch]
                     await asyncio.gather(*tasks, return_exceptions=True)
 
                 await asyncio.sleep(Config.MAIN_LOOP_SEC)
