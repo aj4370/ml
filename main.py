@@ -940,9 +940,14 @@ class TechnicalAnalyzer:
             except Exception:
                 bb4_shell = False
 
-            # RSI 기반 강세: 기존 조건 유지
-            cond_r4_strong = (bb4_shell and r4 >= 70) or (bb4_shell and r30 >= 70 and r1 >= 70 and r4 >= 60)
-            cond_rsi_strong = cond_r4_strong and (r1 >= 60) and (r30 >= 60) and (r15 >= 55)
+            # RSI 기반 강세: bb4_shell 의존성 제거 (BB수축 없어도 진입 가능)
+            # bb4_shell=True이면 기준 완화, False이면 더 높은 RSI 요구
+            if bb4_shell:
+                cond_r4_strong = (r4 >= 63) or (r30 >= 65 and r1 >= 65 and r4 >= 58)
+                cond_rsi_strong = cond_r4_strong and (r1 >= 55) and (r30 >= 55) and (r15 >= 50)
+            else:
+                cond_r4_strong = (r4 >= 67) or (r30 >= 68 and r1 >= 68 and r4 >= 62)
+                cond_rsi_strong = cond_r4_strong and (r1 >= 58) and (r30 >= 58) and (r15 >= 53)
 
             # MACD 히스토그램 양수(모멘텀)
             cond_macd = (m30_h > 0.0) or (m1_h > 0.0)
@@ -1040,9 +1045,14 @@ class TechnicalAnalyzer:
             except Exception:
                 bb4_shell = False
 
-            # RSI 기반 약세(숏): 과열 반대축
-            cond_r4_weak = (bb4_shell and r4 <= 30) or (bb4_shell and r30 <= 30 and r1 <= 30 and r4 <= 40)
-            cond_rsi_weak = cond_r4_weak and (r1 <= 40) and (r30 <= 40) and (r15 <= 45)
+            # RSI 기반 약세(숏): bb4_shell 의존성 제거 (BB수축 없어도 진입 가능)
+            # bb4_shell=True이면 기준 완화, False이면 더 낮은 RSI 요구
+            if bb4_shell:
+                cond_r4_weak = (r4 <= 37) or (r30 <= 35 and r1 <= 35 and r4 <= 42)
+                cond_rsi_weak = cond_r4_weak and (r1 <= 45) and (r30 <= 45) and (r15 <= 50)
+            else:
+                cond_r4_weak = (r4 <= 33) or (r30 <= 32 and r1 <= 32 and r4 <= 38)
+                cond_rsi_weak = cond_r4_weak and (r1 <= 42) and (r30 <= 42) and (r15 <= 47)
 
             # MACD 히스토그램 음수(모멘텀)
             cond_macd = (m30_h < 0.0) or (m1_h < 0.0)
