@@ -3255,7 +3255,7 @@ class AsyncTradingBot:
 
 
 
-    async def execute_aggressive_order(self, symbol, side, qty, note, total_bal, sl_p=None, depth=None):
+    async def execute_aggressive_order(self, symbol, side, qty, note, total_bal, sl_p=None, depth=None, price_hint=None):
         """
         [교체 버전]
         - ENTRY가 찍혔는데 주문 단계가 안 보이는 문제를 강제로 드러내고(에러 텔레그램),
@@ -3286,10 +3286,18 @@ class AsyncTradingBot:
                 target_p = t.get("last")
 
             if not target_p:
-                self.queue_notify(f"[ERROR] {symbol} 가격 산출 실패 (orderbook/ticker 모두 실패)")
-                return
+                # 오더북/ticker 모두 실패 시 process_symbol에서 넘겨받은 가격 사용
+                if price_hint and float(price_hint) > 0:
+                    target_p = float(price_hint)
+                    self.queue_notify(f"[PRICE_FALLBACK] {symbol} 오더북/ticker 실패 → OHLCV 가격 사용({target_p})")
+                else:
+                    self.queue_notify(f"[ERROR] {symbol} 가격 산출 실패 (orderbook/ticker/hint 모두 실패)")
+                    return
 
             target_p = float(self.exchange.price_to_precision(symbol, float(target_p)))
+            if target_p <= 0:
+                self.queue_notify(f"[ENTRY_BLOCK] {symbol} price_to_precision 결과 0 (원본={price_hint})")
+                return
 
             # qty 정밀도/최소수량 처리
             qty_raw = float(qty)
@@ -3823,6 +3831,7 @@ class AsyncTradingBot:
                     total_bal,
                     sl_p=float(sl_final),
                     depth=None,
+                    price_hint=float(entry_price),  # 오더북 실패 시 fallback 가격
                 )
 
             except Exception as e:
