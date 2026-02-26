@@ -141,8 +141,8 @@ class Config:
 
     # [NEW] Time Stop - 진입 후 N봉 동안 진행(유리방향 이동)이 없으면 청산
     TIME_STOP_TF = "5m"
-    TIME_STOP_BARS = 8                 # 8봉 = 40분 (요청값)
-    TIME_STOP_PROGRESS_ATR_MULT = 0.5  # 진행 기준 = (trail_pct * 0.5) 이상
+    TIME_STOP_BARS = 24                # 24봉 = 2시간 (8봉=40분은 너무 짧아 완화)
+    TIME_STOP_PROGRESS_ATR_MULT = 0.3  # 진행 기준 완화: trail_pct * 0.3 (기존 0.5)
 
     # [NEW] SHORT 사용 여부
     ENABLE_SHORT = True
@@ -952,12 +952,12 @@ class TechnicalAnalyzer:
             # MACD 히스토그램 양수(모멘텀)
             cond_macd = (m30_h > 0.0) or (m1_h > 0.0)
 
-            # 15m 거래량: 현재봉 > 20MA
+            # 15m 거래량: 완성된 이전봉[-2] > 20MA (현재봉은 미완성이므로 제외)
             v15 = df15["volume"].astype(float)
             v15_ma20 = v15.rolling(20).mean()
             cond_vol = False
             if len(v15) >= 25:
-                cond_vol = float(v15.iloc[-1]) > float(v15_ma20.iloc[-1])
+                cond_vol = float(v15.iloc[-2]) > float(v15_ma20.iloc[-2])
 
             # ADX 트렌드 필터(15m)
             cond_adx = False
@@ -992,13 +992,14 @@ class TechnicalAnalyzer:
                 if not cond_bb_expand:
                     return False, ""
 
-            ok = cond_rsi_strong and cond_macd and cond_vol and cond_adx
+            # MACD 또는 거래량 중 하나 충족으로 완화 (AND 4개 → 3/4 완화)
+            ok = cond_rsi_strong and (cond_macd or cond_vol) and cond_adx
 
             if ok:
                 msg = (
                     f"[COMMON_LONG] RSI 4h/1h/30m/15m={r4:.2f}/{r1:.2f}/{r30:.2f}/{r15:.2f} | "
-                    f"MACD_hist(30m/1h)={m30_h:.4f}/{m1_h:.4f} | "
-                    f"VOL15>{'MA20' if cond_vol else 'x'} | "
+                    f"MACD={'OK' if cond_macd else 'x'}({m30_h:.4f}/{m1_h:.4f}) | "
+                    f"VOL15={'OK' if cond_vol else 'x'} | "
                     f"ADX15={'OK' if cond_adx else 'x'}"
                 )
                 if cond_bb_expand:
@@ -1007,7 +1008,8 @@ class TechnicalAnalyzer:
 
             return False, ""
 
-        except Exception:
+        except Exception as e:
+            write_log(ERROR_LOG_FILE, f"[COMMON_LONG_ERR] {e}", include_traceback=True)
             return False, ""
 
     @staticmethod
@@ -1057,12 +1059,12 @@ class TechnicalAnalyzer:
             # MACD 히스토그램 음수(모멘텀)
             cond_macd = (m30_h < 0.0) or (m1_h < 0.0)
 
-            # 15m 거래량: 현재봉 > 20MA (변동성/체결활성)
+            # 15m 거래량: 완성된 이전봉[-2] > 20MA (현재봉은 미완성이므로 제외)
             v15 = df15["volume"].astype(float)
             v15_ma20 = v15.rolling(20).mean()
             cond_vol = False
             if len(v15) >= 25:
-                cond_vol = float(v15.iloc[-1]) > float(v15_ma20.iloc[-1])
+                cond_vol = float(v15.iloc[-2]) > float(v15_ma20.iloc[-2])
 
             # ADX 트렌드 필터(15m): 방향 무관(강한 추세면 OK)
             cond_adx = False
@@ -1097,13 +1099,14 @@ class TechnicalAnalyzer:
                 if not cond_bb_expand:
                     return False, ""
 
-            ok = cond_rsi_weak and cond_macd and cond_vol and cond_adx
+            # MACD 또는 거래량 중 하나 충족으로 완화 (AND 4개 → 3/4 완화)
+            ok = cond_rsi_weak and (cond_macd or cond_vol) and cond_adx
 
             if ok:
                 msg = (
                     f"[COMMON_SHORT] RSI 4h/1h/30m/15m={r4:.2f}/{r1:.2f}/{r30:.2f}/{r15:.2f} | "
-                    f"MACD_hist(30m/1h)={m30_h:.4f}/{m1_h:.4f} | "
-                    f"VOL15>{'MA20' if cond_vol else 'x'} | "
+                    f"MACD={'OK' if cond_macd else 'x'}({m30_h:.4f}/{m1_h:.4f}) | "
+                    f"VOL15={'OK' if cond_vol else 'x'} | "
                     f"ADX15={'OK' if cond_adx else 'x'}"
                 )
                 if cond_bb_expand:
@@ -1112,7 +1115,8 @@ class TechnicalAnalyzer:
 
             return False, ""
 
-        except Exception:
+        except Exception as e:
+            write_log(ERROR_LOG_FILE, f"[COMMON_SHORT_ERR] {e}", include_traceback=True)
             return False, ""
 
     @staticmethod
@@ -1214,24 +1218,23 @@ class TechnicalAnalyzer:
                     return False, full_exit, 0.0, "", "", "", details
 
             bull_prev = (c_prev > o_prev)
-            bull_now = (c_now > o_now)
             bear_prev = (c_prev < o_prev)
-            bear_now = (c_now < o_now)
+            # bull_now/bear_now 제거: 현재봉은 아직 형성 중(미완성)이므로 판단에서 제외
 
             # -------------------------
-            # LONG: 5m ST(10,2) 터치 + ST 상승 + 2연속 양봉
+            # LONG: 5m ST(10,2) 터치 + ST 상승 + 이전봉 양봉
+            # (bull_now 제거: 미완성 현재봉 판단 불필요)
             # -------------------------
             if side == "long":
                 touch_prev = (l_prev <= (st_prev + tol)) and (c_prev >= st_prev)
                 st_rise = (st_now >= st_prev) and (dir_prev > 0) and (dir_now > 0)
 
-                if touch_prev and st_rise and bull_prev and bull_now:
-                    # SL: max(min(low_now, low_prev), st_now) (롱은 아래)
+                if touch_prev and st_rise and bull_prev:
+                    # SL: 이전 두 봉 저가 중 높은 쪽과 ST 중 높은 값 (롱은 아래)
                     sl_raw = max(min(l_now, l_prev), st_now)
                     details["touch_prev"] = touch_prev
                     details["st_rise"] = st_rise
                     details["bull_prev"] = bull_prev
-                    details["bull_now"] = bull_now
                     details["sl_raw"] = sl_raw
 
                     return True, full_exit, float(sl_raw), "Buy_5M_ST10_2_Touch", "ST_5m", common_msg, details
@@ -1239,24 +1242,21 @@ class TechnicalAnalyzer:
                 return False, full_exit, 0.0, "", "", "", details
 
             # -------------------------
-            # SHORT: 5m ST(10,2) 리테스트(위쪽 터치) + ST 하락 + 2연속 음봉
+            # SHORT: 5m ST(10,2) 리테스트(위쪽 터치) + ST 하락 + 이전봉 음봉
+            # (bear_now 제거: 미완성 현재봉 판단 불필요)
             # -------------------------
             if side == "short":
                 # 숏: 슈퍼트렌드가 하방(-1)이고, 이전봉 고가가 ST 근처까지 닿았다가(리테스트) 종가가 ST 아래
                 touch_prev = (h_prev >= (st_prev - tol)) and (c_prev <= st_prev)
                 st_fall = (st_now <= st_prev) and (dir_prev < 0) and (dir_now < 0)
 
-                if touch_prev and st_fall and bear_prev and bear_now:
-                    # SL: min(max(high_now, high_prev), st_now) (숏은 위)
-                    sl_raw = min(max(h_now, h_prev), st_now)
-                    # SL이 현재가 위에 있어야 함
-                    if sl_raw <= c_now:
-                        sl_raw = max(h_now, h_prev, st_now)
+                if touch_prev and st_fall and bear_prev:
+                    # SL: 최근 두 봉 고가와 ST 중 최댓값 (숏은 위, 항상 현재가 위에 있어야 함)
+                    sl_raw = max(h_now, h_prev, st_now)
 
                     details["touch_prev"] = touch_prev
                     details["st_fall"] = st_fall
                     details["bear_prev"] = bear_prev
-                    details["bear_now"] = bear_now
                     details["sl_raw"] = sl_raw
 
                     return True, full_exit, float(sl_raw), "Sell_5M_ST10_2_Retest", "ST_5m", common_msg, details
@@ -3654,26 +3654,26 @@ class AsyncTradingBot:
                         except Exception:
                             df5i = df5
 
-                        # 캔들 + EMA20
+                        # 캔들 + EMA20 - 완성된 이전봉[-2] 기준으로 판단 (현재봉[-1]은 미완성)
                         try:
-                            o_now = float(df5i["open"].iloc[-1])
-                            c_now = float(df5i["close"].iloc[-1])
-                            e_now = float(df5i["ema20"].iloc[-1]) if "ema20" in df5i.columns else None
+                            o_prev2 = float(df5i["open"].iloc[-2])
+                            c_prev2 = float(df5i["close"].iloc[-2])
+                            e_prev2 = float(df5i["ema20"].iloc[-2]) if "ema20" in df5i.columns else None
                         except Exception:
-                            o_now, c_now, e_now = 0.0, 0.0, None
+                            o_prev2, c_prev2, e_prev2 = 0.0, 0.0, None
 
                         full_exit = False
-                        if e_now and float(e_now) > 0:
-                            bull_now = (c_now > o_now)
-                            bear_now = (c_now < o_now)
+                        if e_prev2 and float(e_prev2) > 0:
+                            bull_prev2 = (c_prev2 > o_prev2)
+                            bear_prev2 = (c_prev2 < o_prev2)
 
                             if is_long:
-                                # 롱: EMA20 하향 이탈 + 음봉
-                                if (c_now < float(e_now)) and bear_now:
+                                # 롱: 완성봉이 EMA20 하향 이탈 + 음봉
+                                if (c_prev2 < float(e_prev2)) and bear_prev2:
                                     full_exit = True
                             else:
-                                # 숏: EMA20 상향 돌파 + 양봉
-                                if (c_now > float(e_now)) and bull_now:
+                                # 숏: 완성봉이 EMA20 상향 돌파 + 양봉
+                                if (c_prev2 > float(e_prev2)) and bull_prev2:
                                     full_exit = True
 
                         if full_exit:
@@ -3730,6 +3730,7 @@ class AsyncTradingBot:
                 # 이미 포지션 있으면 스킵(방향 무관)
                 pos0 = await self.get_safe_position(symbol)
                 if pos0 is None:
+                    write_log(ERROR_LOG_FILE, f"[PROC_SKIP] {symbol} pos 조회 실패(None), 진입 스킵")
                     return
                 c0 = abs(self._get_pos_num(pos0, "contracts", "size", default=0.0))
                 if c0 > 0:
@@ -3738,10 +3739,12 @@ class AsyncTradingBot:
                 # 데이터 fetch + 지표
                 dfs = await self.data_manager.fetch_entry_data(symbol, limit=260)
                 if not dfs:
+                    write_log(ERROR_LOG_FILE, f"[PROC_SKIP] {symbol} entry data fetch 실패, 진입 스킵")
                     return
                 try:
                     dfs = TechnicalAnalyzer.add_indicators(dfs)
-                except Exception:
+                except Exception as e:
+                    write_log(ERROR_LOG_FILE, f"[PROC_SKIP] {symbol} 지표 계산 실패: {e}, 진입 스킵")
                     return
 
                 sig, _, entry_sl, st_name, sl_src, _, details = await TechnicalAnalyzer.check_signals(dfs, side=side)
@@ -3786,6 +3789,9 @@ class AsyncTradingBot:
                     min_leverage=1.5,
                 )
                 if not qty or float(qty) <= 0:
+                    write_log(ERROR_LOG_FILE,
+                        f"[PROC_SKIP] {symbol} qty=0 산출 (bal={total_bal:.2f}, price={entry_price:.6f}, "
+                        f"sl={sl_final:.6f}, lev={lev}), 진입 스킵")
                     return
 
                 # 레버리지 세팅
@@ -3842,8 +3848,16 @@ class AsyncTradingBot:
                 try:
                     bal_info = await self._api_call(self.exchange.fetch_balance, tag="main_bal", sem=self.api_sem)
                     total_bal = float((bal_info.get("total") or {}).get("USDT") or 0.0)
-                except Exception:
-                    total_bal = 0.0
+                except Exception as e:
+                    write_log(ERROR_LOG_FILE, f"[BAL_FAIL] 잔고 조회 실패, 이번 루프 스킵: {e}")
+                    self.queue_notify(f"[BAL_FAIL] 잔고 조회 실패: {e}")
+                    await asyncio.sleep(Config.MAIN_LOOP_SEC)
+                    continue
+
+                if total_bal <= 0:
+                    write_log(ERROR_LOG_FILE, "[BAL_ZERO] 잔고 0 또는 음수, 이번 루프 스킵")
+                    await asyncio.sleep(Config.MAIN_LOOP_SEC)
+                    continue
 
                 # -------------------------
                 # 1) 후보 심볼
@@ -3869,11 +3883,13 @@ class AsyncTradingBot:
                     try:
                         dfs_common = await self.data_manager.fetch_common_data(sym, limit=260)
                         if not dfs_common:
+                            write_log(ERROR_LOG_FILE, f"[COMMON_SKIP] {sym} common data fetch 실패")
                             return sym, (False, False, "", "")
                         dfs_common = TechnicalAnalyzer.add_indicators(dfs_common)
                         l_ok, s_ok, l_msg, s_msg = await TechnicalAnalyzer.check_common_conditions_sides(dfs_common)
                         return sym, (l_ok, s_ok, l_msg, s_msg)
-                    except Exception:
+                    except Exception as e:
+                        write_log(ERROR_LOG_FILE, f"[COMMON_ERR] {sym} 공통필터 예외: {e}")
                         return sym, (False, False, "", "")
 
                 batch = []
