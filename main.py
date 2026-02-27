@@ -1405,6 +1405,7 @@ class AsyncTradingBot:
         self.ts_dist_map = {}   # key=(symbol,pos_idx) -> float(last applied)
         self.group_id_map = {}  # key=(symbol,pos_idx) -> group_id
         self.event_cli = None
+        self._free_bal = 0.0    # 가용(free) 잔고 캐시 (run_loop에서 갱신)
 
         # [추가] 심볼 단위 진입 락(동일 심볼 중복 진입 방지)
         self.entry_locks = {}  # symbol -> asyncio.Lock
@@ -3818,8 +3819,8 @@ class AsyncTradingBot:
 
                 curr_m = self._estimate_position_margin(pos0, curr_price=float(entry_price))
 
-                lev, qty, risk_pct = RiskManager.calculate_entry_params(
-                    float(total_bal),
+                lev, qty, needed_m = RiskManager.calculate_entry_params(
+                    float(total_bal),        # 사이즈 계산은 총 잔고 기준 유지
                     float(entry_price),
                     float(sl_final),
                     float(max_lev),
@@ -3831,6 +3832,13 @@ class AsyncTradingBot:
                     write_log(ERROR_LOG_FILE,
                         f"[PROC_SKIP] {symbol} qty=0 산출 (bal={total_bal:.2f}, price={entry_price:.6f}, "
                         f"sl={sl_final:.6f}, lev={lev}), 진입 스킵")
+                    return
+
+                # 가용 잔고(free) 대비 필요 증거금 체크 → ORDER_FATAL ab not enough 방지
+                free_now = float(self._free_bal or total_bal)
+                if needed_m > 0 and free_now > 0 and needed_m > free_now * 1.05:
+                    write_log(ERROR_LOG_FILE,
+                        f"[SKIP_NO_MARGIN] {symbol} 필요증거금({needed_m:.2f}) > 가용잔고({free_now:.2f}), 진입 스킵")
                     return
 
                 # 레버리지 세팅
@@ -3888,9 +3896,8 @@ class AsyncTradingBot:
                 try:
                     bal_info = await self._api_call(self.exchange.fetch_balance, tag="main_bal", sem=self.api_sem)
                     total_bal = float((bal_info.get("total") or {}).get("USDT") or 0.0)
-                    # 포지션 진입 수량 계산은 가용(free) 잔고 기준 사용 → ORDER_FATAL ab not enough 방지
-                    free_bal = float((bal_info.get("free") or {}).get("USDT") or 0.0)
-                    entry_bal = free_bal if free_bal > 0 else total_bal
+                    # 가용 잔고(free): needed_m 초과 여부 체크용 (사이즈 계산은 total_bal 기준 유지)
+                    self._free_bal = float((bal_info.get("free") or {}).get("USDT") or total_bal)
                 except Exception as e:
                     write_log(ERROR_LOG_FILE, f"[BAL_FAIL] 잔고 조회 실패, 이번 루프 스킵: {e}")
                     self.queue_notify(f"[BAL_FAIL] 잔고 조회 실패: {e}")
@@ -3998,13 +4005,13 @@ class AsyncTradingBot:
                 for sym, msg, side in ent_candidates:
                     ent_batch.append((sym, msg, side))
                     if len(ent_batch) >= int(getattr(Config, "MAIN_BATCH_SIZE", 10) or 10):
-                        # 진입 수량 계산은 free(가용) 잔고 기준
-                        tasks = [self.process_symbol(x, entry_bal, side=sd, common_msg=m) for x, m, sd in ent_batch]
+                        # 포지션 사이즈 계산은 총 잔고(total_bal) 기준 유지
+                        tasks = [self.process_symbol(x, total_bal, side=sd, common_msg=m) for x, m, sd in ent_batch]
                         await asyncio.gather(*tasks, return_exceptions=True)
                         ent_batch = []
 
                 if ent_batch:
-                    tasks = [self.process_symbol(x, entry_bal, side=sd, common_msg=m) for x, m, sd in ent_batch]
+                    tasks = [self.process_symbol(x, total_bal, side=sd, common_msg=m) for x, m, sd in ent_batch]
                     await asyncio.gather(*tasks, return_exceptions=True)
 
                 await asyncio.sleep(Config.MAIN_LOOP_SEC)
