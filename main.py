@@ -2968,6 +2968,12 @@ class AsyncTradingBot:
                     tag=f"v5_set_trading_stop:{symbol}",
                     sem=use_sem,
                 )
+            else:
+                # ccxt Bybit 버전에 따라 메서드명이 다를 수 있음 - 직접 API 호출
+                write_log(ERROR_LOG_FILE,
+                    f"[SL_METHOD_MISSING] {symbol} privatePostV5PositionTradingStop 없음 - "
+                    "ccxt Bybit 버전 확인 필요. SL 미설정!")
+                self.queue_notify(f"[SL_WARN] {symbol} SL API 메서드 없음 - ccxt 버전 확인 필요")
 
             return True
 
@@ -3583,7 +3589,9 @@ class AsyncTradingBot:
 
             pnl_val = self._get_pos_num(pos, "unrealisedPnl", "unrealised_pnl", default=0.0)
 
-            if (pnl_val / float(total_bal)) * 100 <= Config.HARD_STOP_LOSS_PERCENT:
+            # HARD_STOP_LOSS_PERCENT = -0.009 (소수 형태, -0.9% 의미)
+            # pnl_val / total_bal 도 소수 형태이므로 * 100 없이 비교
+            if (pnl_val / float(total_bal)) <= Config.HARD_STOP_LOSS_PERCENT:
                 qty = abs(self._get_pos_num(pos, "contracts", "size", default=0.0))
                 if qty > 0:
                     close_side = self._close_side_for_pos(pos)
@@ -3611,15 +3619,22 @@ class AsyncTradingBot:
     async def exit_loop(self):
         """
         [NEW] 포지션 관리 루프 (LONG/SHORT 공용)
-        - 긴 로직(다중 조건/예외) 대신 "안정성 우선" 버전으로 단순화
         - 핵심:
-            1) 5m EMA20 반대 돌파 + 반대봉 확인 -> 즉시 시장가 청산(강제)
-            2) 그 외에는 manage_dynamic_stop_loss()에서 SL/TS/TimeStop 관리
-            3) (옵션) ST flip top-up은 LONG에서만 유지
+            1) 하드스탑: 총 손실 한도 초과 시 즉시 전량 청산
+            2) 부분익절: PnL 임계치 도달 시 일부 청산
+            3) 5m EMA20 반대 돌파 + 반대봉 확인 -> 즉시 시장가 청산(강제)
+            4) 그 외에는 manage_dynamic_stop_loss()에서 SL/TS/TimeStop 관리
         """
         await asyncio.sleep(3)
         while self.is_running:
             try:
+                # 잔고 조회 (손절/익절 기준 계산용)
+                try:
+                    bal_info = await self._api_call(self.exchange.fetch_balance, tag="exit_bal", sem=self.api_sem)
+                    total_bal_exit = float((bal_info.get("total") or {}).get("USDT") or 0.0)
+                except Exception:
+                    total_bal_exit = 0.0
+
                 positions = await self.get_all_open_positions()
                 if not positions:
                     await asyncio.sleep(Config.EXIT_LOOP_SEC)
@@ -3648,7 +3663,23 @@ class AsyncTradingBot:
                         if curr_p <= 0:
                             continue
 
-                        # 5m 데이터로 EMA20 확인(긴급청산)
+                        # ① 하드스탑: 손실 한도 초과 시 전량 청산 (최우선)
+                        if total_bal_exit > 0:
+                            try:
+                                stopped = await self.manage_hard_stop(symbol, pos, total_bal_exit)
+                                if stopped:
+                                    continue
+                            except Exception as e:
+                                write_log(ERROR_LOG_FILE, f"[HARD_STOP_ERR] {symbol}: {e}")
+
+                        # ② 부분익절: PnL 임계치 도달 시 일부 청산
+                        if total_bal_exit > 0:
+                            try:
+                                await self.manage_profit_taking(symbol, pos, curr_p, total_bal_exit)
+                            except Exception as e:
+                                write_log(ERROR_LOG_FILE, f"[TP_ERR] {symbol}: {e}")
+
+                        # ③ 5m 데이터로 EMA20 확인(긴급청산)
                         df5 = await self.data_manager.fetch_timeframe_data(symbol, "5m", limit=120)
                         if df5 is None or len(df5) < 30:
                             # 데이터 부족이면 SL/TS만 관리
@@ -3857,6 +3888,9 @@ class AsyncTradingBot:
                 try:
                     bal_info = await self._api_call(self.exchange.fetch_balance, tag="main_bal", sem=self.api_sem)
                     total_bal = float((bal_info.get("total") or {}).get("USDT") or 0.0)
+                    # 포지션 진입 수량 계산은 가용(free) 잔고 기준 사용 → ORDER_FATAL ab not enough 방지
+                    free_bal = float((bal_info.get("free") or {}).get("USDT") or 0.0)
+                    entry_bal = free_bal if free_bal > 0 else total_bal
                 except Exception as e:
                     write_log(ERROR_LOG_FILE, f"[BAL_FAIL] 잔고 조회 실패, 이번 루프 스킵: {e}")
                     self.queue_notify(f"[BAL_FAIL] 잔고 조회 실패: {e}")
@@ -3964,12 +3998,13 @@ class AsyncTradingBot:
                 for sym, msg, side in ent_candidates:
                     ent_batch.append((sym, msg, side))
                     if len(ent_batch) >= int(getattr(Config, "MAIN_BATCH_SIZE", 10) or 10):
-                        tasks = [self.process_symbol(x, total_bal, side=sd, common_msg=m) for x, m, sd in ent_batch]
+                        # 진입 수량 계산은 free(가용) 잔고 기준
+                        tasks = [self.process_symbol(x, entry_bal, side=sd, common_msg=m) for x, m, sd in ent_batch]
                         await asyncio.gather(*tasks, return_exceptions=True)
                         ent_batch = []
 
                 if ent_batch:
-                    tasks = [self.process_symbol(x, total_bal, side=sd, common_msg=m) for x, m, sd in ent_batch]
+                    tasks = [self.process_symbol(x, entry_bal, side=sd, common_msg=m) for x, m, sd in ent_batch]
                     await asyncio.gather(*tasks, return_exceptions=True)
 
                 await asyncio.sleep(Config.MAIN_LOOP_SEC)
