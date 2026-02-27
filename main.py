@@ -2953,7 +2953,16 @@ class AsyncTradingBot:
                 params["slTriggerBy"] = "LastPrice"
 
             if ts_dist is not None and float(ts_dist) > 0:
-                params["trailingStop"] = str(self.exchange.price_to_precision(symbol, float(ts_dist)))
+                ts_raw = float(ts_dist)
+                ts_str = str(self.exchange.price_to_precision(symbol, ts_raw))
+                if float(ts_str) <= 0 and ts_raw > 0:
+                    # 마이크로 코인: price_to_precision 결과가 0 → 유효 소수점 자릿수로 올림
+                    for sig in range(1, 16):
+                        ts_fallback = round(ts_raw, sig)
+                        if ts_fallback > 0:
+                            ts_str = f"{ts_fallback:.{sig}f}"
+                            break
+                params["trailingStop"] = ts_str
 
             if hasattr(self.exchange, "privatePostV5PositionTradingStop"):
                 await self._api_call(
@@ -3139,6 +3148,45 @@ class AsyncTradingBot:
                             return
             except Exception:
                 pass
+
+            # -------- 클라이언트 SL 체크 (서버 SL 미작동 대비 백업) --------
+            try:
+                ref_sl = float(self.initial_sl_map.get(key) or 0.0)
+                if ref_sl > 0:
+                    if is_long and curr_p <= ref_sl:
+                        qty_sl = abs(self._get_pos_num(pos, "contracts", "size", default=0.0))
+                        if float(qty_sl) > 0:
+                            close_side_sl = self._close_side_for_pos(pos)
+                            write_log(ERROR_LOG_FILE,
+                                f"[CLIENT_SL] {symbol} LONG curr_p={curr_p} <= sl={ref_sl} → 시장가 강제 청산")
+                            self.queue_notify(
+                                f"[CLIENT_SL] {symbol} LONG 손절 curr_p={curr_p:.6g} sl={ref_sl:.6g}")
+                            await self._api_call(
+                                self.exchange.create_order,
+                                symbol, "market", close_side_sl, float(qty_sl), None,
+                                params={"reduceOnly": True, "category": "linear",
+                                        "positionIdx": int(pos_idx)},
+                                tag=f"client_sl_close:{symbol}", sem=sem,
+                            )
+                            return
+                    elif (not is_long) and curr_p >= ref_sl:
+                        qty_sl = abs(self._get_pos_num(pos, "contracts", "size", default=0.0))
+                        if float(qty_sl) > 0:
+                            close_side_sl = self._close_side_for_pos(pos)
+                            write_log(ERROR_LOG_FILE,
+                                f"[CLIENT_SL] {symbol} SHORT curr_p={curr_p} >= sl={ref_sl} → 시장가 강제 청산")
+                            self.queue_notify(
+                                f"[CLIENT_SL] {symbol} SHORT 손절 curr_p={curr_p:.6g} sl={ref_sl:.6g}")
+                            await self._api_call(
+                                self.exchange.create_order,
+                                symbol, "market", close_side_sl, float(qty_sl), None,
+                                params={"reduceOnly": True, "category": "linear",
+                                        "positionIdx": int(pos_idx)},
+                                tag=f"client_sl_close:{symbol}", sem=sem,
+                            )
+                            return
+            except Exception as e_csl:
+                write_log(ERROR_LOG_FILE, f"[CLIENT_SL_ERR] {symbol}: {e_csl}")
 
             # -------- 현재 SL/TS 확인 --------
             curr_sl = float(self._get_pos_num(pos, "stopLoss", "stop_loss", "sl", default=0.0) or 0.0)
