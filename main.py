@@ -3628,19 +3628,44 @@ class AsyncTradingBot:
 
 
 
-    async def manage_hard_stop(self, symbol, pos, total_bal):
+    async def manage_hard_stop(self, symbol, pos, total_bal, curr_p=0.0):
         """
         손실 한도 도달 시 전량 청산
+        HARD_STOP_LOSS_PERCENT = -0.009 → 잔고의 -0.9% 이상 손실 시 청산
         """
         try:
             if total_bal is None or float(total_bal) <= 0:
                 return False
 
-            pnl_val = self._get_pos_num(pos, "unrealisedPnl", "unrealised_pnl", default=0.0)
+            # ccxt 통합(American) + Bybit V5 raw(British) 둘 다 시도
+            pnl_val = self._get_pos_num(
+                pos, "unrealizedPnl", "unrealisedPnl", "unrealised_pnl", default=None)
+
+            # API 응답에 PnL 필드 없으면 curr_p로 직접 계산
+            if pnl_val is None and float(curr_p) > 0:
+                try:
+                    ep = self._get_pos_num(pos, "entryPrice", "entry_price", "avgPrice", default=0.0)
+                    contracts = self._get_pos_num(pos, "contracts", "size", default=0.0)
+                    side_raw = str(pos.get("side") or "").lower()
+                    is_long_hs = "buy" in side_raw or "long" in side_raw
+                    if ep > 0 and float(contracts) > 0:
+                        if is_long_hs:
+                            pnl_val = (float(curr_p) - ep) * float(contracts)
+                        else:
+                            pnl_val = (ep - float(curr_p)) * float(contracts)
+                except Exception:
+                    pnl_val = None
+
+            if pnl_val is None:
+                return False
+
+            pnl_ratio = float(pnl_val) / float(total_bal)
+            write_log(ERROR_LOG_FILE,
+                f"[HARD_STOP_CHK] {symbol} pnl={pnl_val:.4f} ratio={pnl_ratio*100:.3f}% "
+                f"threshold={Config.HARD_STOP_LOSS_PERCENT*100:.3f}%")
 
             # HARD_STOP_LOSS_PERCENT = -0.009 (소수 형태, -0.9% 의미)
-            # pnl_val / total_bal 도 소수 형태이므로 * 100 없이 비교
-            if (pnl_val / float(total_bal)) <= Config.HARD_STOP_LOSS_PERCENT:
+            if pnl_ratio <= Config.HARD_STOP_LOSS_PERCENT:
                 qty = abs(self._get_pos_num(pos, "contracts", "size", default=0.0))
                 if qty > 0:
                     close_side = self._close_side_for_pos(pos)
@@ -3715,7 +3740,7 @@ class AsyncTradingBot:
                         # ① 하드스탑: 손실 한도 초과 시 전량 청산 (최우선)
                         if total_bal_exit > 0:
                             try:
-                                stopped = await self.manage_hard_stop(symbol, pos, total_bal_exit)
+                                stopped = await self.manage_hard_stop(symbol, pos, total_bal_exit, curr_p=curr_p)
                                 if stopped:
                                     continue
                             except Exception as e:
