@@ -175,10 +175,10 @@ class Config:
 
     # [추가 - SuperTrend(5m 엔트리/SL 기준)]
     # SuperTrend (Wilder ATR 기반)
-    ST_PERIOD = 10
-    ST_MULTIPLIER = 2.0
-    ST_COL = 'st_10_2'
-    ST_DIR_COL = 'st_dir_10_2'
+    ST_PERIOD = 14
+    ST_MULTIPLIER = 3.0
+    ST_COL = 'st_14_3'
+    ST_DIR_COL = 'st_dir_14_3'
 
     # [추가 - 공통전략 필터]
     ADX_PERIOD = 14
@@ -1222,7 +1222,7 @@ class TechnicalAnalyzer:
             # bull_now/bear_now 제거: 현재봉은 아직 형성 중(미완성)이므로 판단에서 제외
 
             # -------------------------
-            # LONG: 5m ST(10,2) 터치 + ST 상승 + 이전봉 양봉
+            # LONG: 5m ST(14,3) 터치 + ST 상승 + 이전봉 양봉
             # (bull_now 제거: 미완성 현재봉 판단 불필요)
             # -------------------------
             if side == "long":
@@ -1230,19 +1230,19 @@ class TechnicalAnalyzer:
                 st_rise = (st_now >= st_prev) and (dir_prev > 0) and (dir_now > 0)
 
                 if touch_prev and st_rise and bull_prev:
-                    # SL: 이전 두 봉 저가 중 높은 쪽과 ST 중 높은 값 (롱은 아래)
-                    sl_raw = max(min(l_now, l_prev), st_now)
+                    # SL: 5m ST선 직접 사용 (레버리지 갭 최소화)
+                    sl_raw = st_now
                     details["touch_prev"] = touch_prev
                     details["st_rise"] = st_rise
                     details["bull_prev"] = bull_prev
                     details["sl_raw"] = sl_raw
 
-                    return True, full_exit, float(sl_raw), "Buy_5M_ST10_2_Touch", "ST_5m", common_msg, details
+                    return True, full_exit, float(sl_raw), "Buy_5M_ST14_3_Touch", "ST_5m", common_msg, details
 
                 return False, full_exit, 0.0, "", "", "", details
 
             # -------------------------
-            # SHORT: 5m ST(10,2) 리테스트(위쪽 터치) + ST 하락 + 이전봉 음봉
+            # SHORT: 5m ST(14,3) 리테스트(위쪽 터치) + ST 하락 + 이전봉 음봉
             # (bear_now 제거: 미완성 현재봉 판단 불필요)
             # -------------------------
             if side == "short":
@@ -1251,15 +1251,15 @@ class TechnicalAnalyzer:
                 st_fall = (st_now <= st_prev) and (dir_prev < 0) and (dir_now < 0)
 
                 if touch_prev and st_fall and bear_prev:
-                    # SL: 최근 두 봉 고가와 ST 중 최댓값 (숏은 위, 항상 현재가 위에 있어야 함)
-                    sl_raw = max(h_now, h_prev, st_now)
+                    # SL: 5m ST선 직접 사용 (레버리지 갭 최소화)
+                    sl_raw = st_now
 
                     details["touch_prev"] = touch_prev
                     details["st_fall"] = st_fall
                     details["bear_prev"] = bear_prev
                     details["sl_raw"] = sl_raw
 
-                    return True, full_exit, float(sl_raw), "Sell_5M_ST10_2_Retest", "ST_5m", common_msg, details
+                    return True, full_exit, float(sl_raw), "Sell_5M_ST14_3_Retest", "ST_5m", common_msg, details
 
                 return False, full_exit, 0.0, "", "", "", details
 
@@ -1562,8 +1562,8 @@ class AsyncTradingBot:
             df5[["h", "l", "c"]]  = df5[["h", "l", "c"]].apply(pd.to_numeric, errors="coerce")
 
             # --- SuperTrend 계산 (필요시 period/multiplier 여기서 조정) ---
-            st15, dir15 = self._calc_supertrend_dir(df15, period=10, multiplier=3.0)
-            st5,  dir5  = self._calc_supertrend_dir(df5,  period=10, multiplier=3.0)
+            st15, dir15 = self._calc_supertrend_dir(df15, period=14, multiplier=3.0)
+            st5,  dir5  = self._calc_supertrend_dir(df5,  period=14, multiplier=3.0)
             if st15 is None or dir15 is None or st5 is None or dir5 is None:
                 return
             if len(dir15) < 3 or len(dir5) < 4:
@@ -3064,9 +3064,9 @@ class AsyncTradingBot:
         - 포지션 방향을 자동 판별 (Buy=LONG, Sell=SHORT)
         - SL:
             - SL 없으면(0) 최초 SL(맵) 또는 recovery_sl로 복구
-            - 5m SuperTrend(10,2) 기반으로 유리한 방향으로만 업데이트
-              LONG: ST 상방(+1) & low >= ST 일 때, SL = ST - ATR*ATR_SL_5M_K
-              SHORT: ST 하방(-1) & high <= ST 일 때, SL = ST + ATR*ATR_SL_5M_K
+            - 5m SuperTrend(14,3) 기반으로 유리한 방향으로만 업데이트
+              LONG: ST 방향==1 일 때, SL = ST선 (방향이 -1이면 재설정 금지)
+              SHORT: ST 방향==-1 일 때, SL = ST선 (방향이 +1이면 재설정 금지)
         - TS:
             - 15m ATR%로 trail_pct 산출 (TS_MIN_PCT~TS_MAX_PCT)
             - activation_pct(ATR% 기반) 만큼 유리하게 진행된 뒤에만 서버 TS 등록
@@ -3224,43 +3224,36 @@ class AsyncTradingBot:
                     except Exception:
                         pass
 
-                    if "atr" in df.columns and "st" in df.columns and "st_dir" in df.columns:
-                        atr = float(df["atr"].iloc[-1] or 0.0)
+                    if "st" in df.columns and "st_dir" in df.columns:
                         st = float(df["st"].iloc[-1] or 0.0)
-                        st_dir = float(df["st_dir"].iloc[-1] or 0.0)
-                        high_now = float(df["high"].iloc[-1] if "high" in df.columns else df["h"].iloc[-1])
-                        low_now = float(df["low"].iloc[-1] if "low" in df.columns else df["l"].iloc[-1])
-
-                        k = float(getattr(Config, "ATR_SL_5M_K", 0.20) or 0.20)
+                        st_dir = int(df["st_dir"].iloc[-1] or 0)
 
                         if is_long:
-                            if st > 0 and st_dir > 0 and low_now >= st:
-                                desired_sl = st - (atr * k) if (atr > 0 and k > 0) else st
-                                # 유리하게만: SL 올리기
-                                if desired_sl and desired_sl > 0:
-                                    if curr_sl <= 0 or (desired_sl > curr_sl and desired_sl < curr_p):
-                                        curr_sl = float(desired_sl)
-                                        await self.apply_exchange_v5_trading_stop(
-                                            symbol,
-                                            sl_price=float(curr_sl),
-                                            ts_dist=None,
-                                            pos_idx=int(pos_idx),
-                                            sem=sem,
-                                        )
+                            # 롱: ST 방향==1(상승) 일 때만 SL 재설정
+                            # 방향이 -1로 바뀌면 재설정 금지 (SL을 아래로 내리는 건 무의미)
+                            if st > 0 and st_dir == 1:
+                                desired_sl = st  # ST선 직접 사용
+                                # 유리하게만(올릴 때만): 현재 SL보다 높고 현재가보다 낮아야
+                                if desired_sl > 0 and (curr_sl <= 0 or (desired_sl > curr_sl and desired_sl < curr_p)):
+                                    curr_sl = float(desired_sl)
+                                    write_log(ERROR_LOG_FILE,
+                                        f"[SL_UPDATE] {symbol} LONG SL→{curr_sl:.6g} (ST={st:.6g})")
+                                    await self.apply_exchange_v5_trading_stop(
+                                        symbol, sl_price=float(curr_sl), ts_dist=None,
+                                        pos_idx=int(pos_idx), sem=sem)
                         else:
-                            if st > 0 and st_dir < 0 and high_now <= st:
-                                desired_sl = st + (atr * k) if (atr > 0 and k > 0) else st
-                                # 유리하게만: SL 내리기(숏은 SL이 내려갈수록 유리)
-                                if desired_sl and desired_sl > 0:
-                                    if curr_sl <= 0 or (desired_sl < curr_sl and desired_sl > curr_p):
-                                        curr_sl = float(desired_sl)
-                                        await self.apply_exchange_v5_trading_stop(
-                                            symbol,
-                                            sl_price=float(curr_sl),
-                                            ts_dist=None,
-                                            pos_idx=int(pos_idx),
-                                            sem=sem,
-                                        )
+                            # 숏: ST 방향==-1(하락) 일 때만 SL 재설정
+                            # 방향이 +1로 바뀌면 재설정 금지 (SL을 위로 올리는 건 무의미)
+                            if st > 0 and st_dir == -1:
+                                desired_sl = st  # ST선 직접 사용
+                                # 유리하게만(내릴 때만): 현재 SL보다 낮고 현재가보다 높아야
+                                if desired_sl > 0 and (curr_sl <= 0 or (desired_sl < curr_sl and desired_sl > curr_p)):
+                                    curr_sl = float(desired_sl)
+                                    write_log(ERROR_LOG_FILE,
+                                        f"[SL_UPDATE] {symbol} SHORT SL→{curr_sl:.6g} (ST={st:.6g})")
+                                    await self.apply_exchange_v5_trading_stop(
+                                        symbol, sl_price=float(curr_sl), ts_dist=None,
+                                        pos_idx=int(pos_idx), sem=sem)
             except Exception:
                 pass
 
@@ -3767,32 +3760,35 @@ class AsyncTradingBot:
                         except Exception:
                             df5i = df5
 
-                        # 캔들 + EMA20 - 완성된 이전봉[-2] 기준으로 판단 (현재봉[-1]은 미완성)
+                        # 5m ST 방향 기반 손절조건
+                        # 완성된 이전봉[-2], 현재봉[-1] ST 방향으로 판단
                         try:
+                            st_dir_prev = int(df5i["st_dir"].iloc[-2]) if "st_dir" in df5i.columns else 0
+                            st_dir_curr = int(df5i["st_dir"].iloc[-1]) if "st_dir" in df5i.columns else 0
                             o_prev2 = float(df5i["open"].iloc[-2])
                             c_prev2 = float(df5i["close"].iloc[-2])
-                            e_prev2 = float(df5i["ema20"].iloc[-2]) if "ema20" in df5i.columns else None
                         except Exception:
-                            o_prev2, c_prev2, e_prev2 = 0.0, 0.0, None
+                            st_dir_prev, st_dir_curr, o_prev2, c_prev2 = 0, 0, 0.0, 0.0
 
                         full_exit = False
-                        if e_prev2 and float(e_prev2) > 0:
-                            bull_prev2 = (c_prev2 > o_prev2)
+                        if st_dir_prev != 0 and st_dir_curr != 0:
                             bear_prev2 = (c_prev2 < o_prev2)
+                            bull_prev2 = (c_prev2 > o_prev2)
 
                             if is_long:
-                                # 롱: 완성봉이 EMA20 하향 이탈 + 음봉
-                                if (c_prev2 < float(e_prev2)) and bear_prev2:
+                                # 롱 손절: 이전봉 ST방향==-1 + 현재봉 ST방향==-1 + 이전봉 음봉
+                                if st_dir_prev == -1 and st_dir_curr == -1 and bear_prev2:
                                     full_exit = True
                             else:
-                                # 숏: 완성봉이 EMA20 상향 돌파 + 양봉
-                                if (c_prev2 > float(e_prev2)) and bull_prev2:
+                                # 숏 손절: 이전봉 ST방향==1 + 현재봉 ST방향==1 + 이전봉 양봉
+                                if st_dir_prev == 1 and st_dir_curr == 1 and bull_prev2:
                                     full_exit = True
 
                         if full_exit:
                             close_side = self._close_side_for_pos(pos)
                             self.queue_notify(
-                                f"[EXIT_EMA20] {symbol} {'LONG' if is_long else 'SHORT'} | qty={qty} P={curr_p}"
+                                f"[EXIT_ST] {symbol} {'LONG' if is_long else 'SHORT'} "
+                                f"ST방향전환 손절 | dir_prev={st_dir_prev} dir_curr={st_dir_curr} P={curr_p}"
                             )
                             await self._api_call(
                                 self.exchange.create_order,
@@ -3802,7 +3798,7 @@ class AsyncTradingBot:
                                 float(qty),
                                 None,
                                 params={"reduceOnly": True, "category": "linear", "positionIdx": int(pos_idx)},
-                                tag=f"exit_ema20:{symbol}",
+                                tag=f"exit_st_flip:{symbol}",
                                 sem=self.exit_sem,
                             )
                             continue
