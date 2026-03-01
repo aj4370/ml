@@ -493,6 +493,13 @@ class DataManager:
         """호환용(미사용): Config.TIMEFRAMES 전체 fetch"""
         return await self.fetch_timeframes(symbol, Config.TIMEFRAMES, limit=limit)
 
+    async def fetch_timeframe_data(self, symbol, timeframe, limit=300):
+        """단일 타임프레임 DataFrame 반환 (SL재설정/손절조건/ATR계산에서 사용)"""
+        result = await self.fetch_timeframes(symbol, [timeframe], limit=limit)
+        if result is None:
+            return None
+        return result.get(timeframe)
+
     async def get_target_price_by_orderbook(self, symbol, side, depth_step=5):
         """오더북 기반 목표가 산출 (동시성 제한 적용)"""
         try:
@@ -3201,6 +3208,8 @@ class AsyncTradingBot:
                     curr_sl = float(recovery_sl)
 
                 if curr_sl > 0:
+                    write_log(ERROR_LOG_FILE, f"[SL_RECOVERY] {symbol} SL 복구 → {curr_sl:.6g}")
+                    self.queue_notify(f"[SL_RECOVERY] {symbol} SL 누락 → 복구 {curr_sl:.6g}")
                     await self.apply_exchange_v5_trading_stop(
                         symbol,
                         sl_price=float(curr_sl),
@@ -3238,6 +3247,8 @@ class AsyncTradingBot:
                                     curr_sl = float(desired_sl)
                                     write_log(ERROR_LOG_FILE,
                                         f"[SL_UPDATE] {symbol} LONG SL→{curr_sl:.6g} (ST={st:.6g})")
+                                    self.queue_notify(
+                                        f"[SL_UPDATE] {symbol} LONG SL 재설정 → {curr_sl:.6g} (ST14,3)")
                                     await self.apply_exchange_v5_trading_stop(
                                         symbol, sl_price=float(curr_sl), ts_dist=None,
                                         pos_idx=int(pos_idx), sem=sem)
@@ -3251,11 +3262,13 @@ class AsyncTradingBot:
                                     curr_sl = float(desired_sl)
                                     write_log(ERROR_LOG_FILE,
                                         f"[SL_UPDATE] {symbol} SHORT SL→{curr_sl:.6g} (ST={st:.6g})")
+                                    self.queue_notify(
+                                        f"[SL_UPDATE] {symbol} SHORT SL 재설정 → {curr_sl:.6g} (ST14,3)")
                                     await self.apply_exchange_v5_trading_stop(
                                         symbol, sl_price=float(curr_sl), ts_dist=None,
                                         pos_idx=int(pos_idx), sem=sem)
-            except Exception:
-                pass
+            except Exception as e_sl:
+                write_log(ERROR_LOG_FILE, f"[SL_UPDATE_ERR] {symbol}: {e_sl}", include_traceback=True)
 
             # -------- Trailing Stop (ATR% 기반, activation 지연) --------
             try:
