@@ -3783,24 +3783,30 @@ class AsyncTradingBot:
                             st_dir_curr  = int(df5i["st_dir"].iloc[-1]) if has_st else 0  # 현재봉
                             o_1prev = float(df5i["open"].iloc[-2])
                             c_1prev = float(df5i["close"].iloc[-2])
+                            o_curr  = float(df5i["open"].iloc[-1])
+                            c_curr  = float(df5i["close"].iloc[-1])
                         except Exception:
                             st_dir_2prev, st_dir_1prev, st_dir_curr = 0, 0, 0
-                            o_1prev, c_1prev = 0.0, 0.0
+                            o_1prev, c_1prev, o_curr, c_curr = 0.0, 0.0, 0.0, 0.0
 
                         full_exit = False
                         if st_dir_2prev != 0 and st_dir_1prev != 0 and st_dir_curr != 0:
                             bear_1prev = (c_1prev < o_1prev)
+                            bear_curr  = (c_curr  < o_curr)
                             bull_1prev = (c_1prev > o_1prev)
+                            bull_curr  = (c_curr  > o_curr)
 
                             if is_long:
-                                # 롱 손절: 2봉전==1 → 1봉전==-1(전환) + 현재봉==-1 + 1봉전 음봉
+                                # 롱 손절: 2봉전==1 → 1봉전==-1(전환) + 현재봉==-1 + (1봉전 음봉 OR 현재봉 음봉)
                                 if (st_dir_2prev == 1 and st_dir_1prev == -1
-                                        and st_dir_curr == -1 and bear_1prev):
+                                        and st_dir_curr == -1
+                                        and (bear_1prev or bear_curr)):
                                     full_exit = True
                             else:
-                                # 숏 손절: 2봉전==-1 → 1봉전==1(전환) + 현재봉==1 + 1봉전 양봉
+                                # 숏 손절: 2봉전==-1 → 1봉전==1(전환) + 현재봉==1 + (1봉전 양봉 OR 현재봉 양봉)
                                 if (st_dir_2prev == -1 and st_dir_1prev == 1
-                                        and st_dir_curr == 1 and bull_1prev):
+                                        and st_dir_curr == 1
+                                        and (bull_1prev or bull_curr)):
                                     full_exit = True
 
                         if full_exit:
