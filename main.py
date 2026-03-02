@@ -3773,35 +3773,41 @@ class AsyncTradingBot:
                         except Exception:
                             df5i = df5
 
-                        # 5m ST 방향 기반 손절조건
-                        # 완성된 이전봉[-2], 현재봉[-1] ST 방향으로 판단
+                        # 5m ST 방향전환 손절조건
+                        # 인덱스: [-3]=2봉전, [-2]=1봉전(전환봉), [-1]=현재봉
+                        # 핵심: [-3]→[-2] 사이에 방향이 바뀌고, [-1]에서 방향 확인 + [-2] 봉 색깔 확인
                         try:
-                            st_dir_prev = int(df5i["st_dir"].iloc[-2]) if "st_dir" in df5i.columns else 0
-                            st_dir_curr = int(df5i["st_dir"].iloc[-1]) if "st_dir" in df5i.columns else 0
-                            o_prev2 = float(df5i["open"].iloc[-2])
-                            c_prev2 = float(df5i["close"].iloc[-2])
+                            has_st = "st_dir" in df5i.columns
+                            st_dir_2prev = int(df5i["st_dir"].iloc[-3]) if has_st else 0  # 2봉전
+                            st_dir_1prev = int(df5i["st_dir"].iloc[-2]) if has_st else 0  # 1봉전 (방향전환봉)
+                            st_dir_curr  = int(df5i["st_dir"].iloc[-1]) if has_st else 0  # 현재봉
+                            o_1prev = float(df5i["open"].iloc[-2])
+                            c_1prev = float(df5i["close"].iloc[-2])
                         except Exception:
-                            st_dir_prev, st_dir_curr, o_prev2, c_prev2 = 0, 0, 0.0, 0.0
+                            st_dir_2prev, st_dir_1prev, st_dir_curr = 0, 0, 0
+                            o_1prev, c_1prev = 0.0, 0.0
 
                         full_exit = False
-                        if st_dir_prev != 0 and st_dir_curr != 0:
-                            bear_prev2 = (c_prev2 < o_prev2)
-                            bull_prev2 = (c_prev2 > o_prev2)
+                        if st_dir_2prev != 0 and st_dir_1prev != 0 and st_dir_curr != 0:
+                            bear_1prev = (c_1prev < o_1prev)
+                            bull_1prev = (c_1prev > o_1prev)
 
                             if is_long:
-                                # 롱 손절: 이전봉 ST방향==-1 + 현재봉 ST방향==-1 + 이전봉 음봉
-                                if st_dir_prev == -1 and st_dir_curr == -1 and bear_prev2:
+                                # 롱 손절: 2봉전==1 → 1봉전==-1(전환) + 현재봉==-1 + 1봉전 음봉
+                                if (st_dir_2prev == 1 and st_dir_1prev == -1
+                                        and st_dir_curr == -1 and bear_1prev):
                                     full_exit = True
                             else:
-                                # 숏 손절: 이전봉 ST방향==1 + 현재봉 ST방향==1 + 이전봉 양봉
-                                if st_dir_prev == 1 and st_dir_curr == 1 and bull_prev2:
+                                # 숏 손절: 2봉전==-1 → 1봉전==1(전환) + 현재봉==1 + 1봉전 양봉
+                                if (st_dir_2prev == -1 and st_dir_1prev == 1
+                                        and st_dir_curr == 1 and bull_1prev):
                                     full_exit = True
 
                         if full_exit:
                             close_side = self._close_side_for_pos(pos)
                             self.queue_notify(
                                 f"[EXIT_ST] {symbol} {'LONG' if is_long else 'SHORT'} "
-                                f"ST방향전환 손절 | dir_prev={st_dir_prev} dir_curr={st_dir_curr} P={curr_p}"
+                                f"ST전환 손절 | 2봉전={st_dir_2prev} 1봉전={st_dir_1prev} 현재={st_dir_curr} P={curr_p}"
                             )
                             await self._api_call(
                                 self.exchange.create_order,
