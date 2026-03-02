@@ -3773,18 +3773,18 @@ class AsyncTradingBot:
                         except Exception:
                             df5i = df5
 
-                        # 5m ST 방향전환 손절조건
-                        # 인덱스: [-3]=2봉전, [-2]=1봉전(전환봉), [-1]=현재봉
-                        # 핵심: [-3]→[-2] 사이에 방향이 바뀌고, [-1]에서 방향 확인 + [-2] 봉 색깔 확인
+                        # 5m ST 방향전환 손절조건 (완성봉만 사용 - [-1]은 형성 중이므로 제외)
+                        # 엔트리 신호와 동일한 규칙: "fetch_ohlcv 마지막은 진행중일 가능성이 큼"
+                        # 완성봉 인덱스: [-4]=2봉전, [-3]=1봉전(전환봉), [-2]=현재완성봉
                         try:
                             has_st = "st_dir" in df5i.columns
-                            st_dir_2prev = int(df5i["st_dir"].iloc[-3]) if has_st else 0  # 2봉전
-                            st_dir_1prev = int(df5i["st_dir"].iloc[-2]) if has_st else 0  # 1봉전 (방향전환봉)
-                            st_dir_curr  = int(df5i["st_dir"].iloc[-1]) if has_st else 0  # 현재봉
-                            o_1prev = float(df5i["open"].iloc[-2])
-                            c_1prev = float(df5i["close"].iloc[-2])
-                            o_curr  = float(df5i["open"].iloc[-1])
-                            c_curr  = float(df5i["close"].iloc[-1])
+                            st_dir_2prev = int(df5i["st_dir"].iloc[-4]) if has_st else 0  # 2봉전 (완성)
+                            st_dir_1prev = int(df5i["st_dir"].iloc[-3]) if has_st else 0  # 1봉전 전환봉 (완성)
+                            st_dir_curr  = int(df5i["st_dir"].iloc[-2]) if has_st else 0  # 현재완성봉 ([-1] 미완성 제외)
+                            o_1prev = float(df5i["open"].iloc[-3])   # 1봉전 봉색
+                            c_1prev = float(df5i["close"].iloc[-3])
+                            o_curr  = float(df5i["open"].iloc[-2])   # 현재완성봉 봉색
+                            c_curr  = float(df5i["close"].iloc[-2])
                         except Exception:
                             st_dir_2prev, st_dir_1prev, st_dir_curr = 0, 0, 0
                             o_1prev, c_1prev, o_curr, c_curr = 0.0, 0.0, 0.0, 0.0
@@ -3797,13 +3797,15 @@ class AsyncTradingBot:
                             bull_curr  = (c_curr  > o_curr)
 
                             if is_long:
-                                # 롱 손절: 2봉전==1 → 1봉전==-1(전환) + 현재봉==-1 + (1봉전 음봉 OR 현재봉 음봉)
+                                # 롱 손절: 2봉전==1 → 1봉전==-1(전환) + 현재완성봉==-1
+                                #          + (1봉전 음봉 OR 현재완성봉 음봉)
                                 if (st_dir_2prev == 1 and st_dir_1prev == -1
                                         and st_dir_curr == -1
                                         and (bear_1prev or bear_curr)):
                                     full_exit = True
                             else:
-                                # 숏 손절: 2봉전==-1 → 1봉전==1(전환) + 현재봉==1 + (1봉전 양봉 OR 현재봉 양봉)
+                                # 숏 손절: 2봉전==-1 → 1봉전==1(전환) + 현재완성봉==1
+                                #          + (1봉전 양봉 OR 현재완성봉 양봉)
                                 if (st_dir_2prev == -1 and st_dir_1prev == 1
                                         and st_dir_curr == 1
                                         and (bull_1prev or bull_curr)):
@@ -3813,7 +3815,8 @@ class AsyncTradingBot:
                             close_side = self._close_side_for_pos(pos)
                             self.queue_notify(
                                 f"[EXIT_ST] {symbol} {'LONG' if is_long else 'SHORT'} "
-                                f"ST전환 손절 | 2봉전={st_dir_2prev} 1봉전={st_dir_1prev} 현재={st_dir_curr} P={curr_p}"
+                                f"ST전환손절 | 2봉전={st_dir_2prev} 1봉전={st_dir_1prev} "
+                                f"현재완성봉={st_dir_curr} P={curr_p}"
                             )
                             await self._api_call(
                                 self.exchange.create_order,
