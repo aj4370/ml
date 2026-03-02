@@ -3126,36 +3126,6 @@ class AsyncTradingBot:
             meta["best_profit_pct"] = float(best_profit_pct)
             self.pos_meta_map[key] = meta
 
-            # -------- Time Stop --------
-            try:
-                bars = int((now - float(meta.get("entry_ts") or now)) / (5 * 60))
-                if bars >= int(getattr(Config, "TIME_STOP_BARS", 8) or 8):
-                    # 진행 기준 = (trail_pct * 0.5) vs 최소 1% 중 큰 값
-                    trail_pct = await self._compute_trailing_pct(symbol, curr_p)
-                    prog = max(float(trail_pct) * float(getattr(Config, "TIME_STOP_PROGRESS_ATR_MULT", 0.5) or 0.5), 0.01)
-                    if float(best_profit_pct) < float(prog):
-                        qty = abs(self._get_pos_num(pos, "contracts", "size", default=0.0))
-                        if qty > 0:
-                            close_side = self._close_side_for_pos(pos)
-                            self.queue_notify(
-                                f"[TIME_STOP] {symbol} {'LONG' if is_long else 'SHORT'} bars={bars} "
-                                f"best={best_profit_pct*100:.2f}% < {prog*100:.2f}% -> CLOSE"
-                            )
-                            await self._api_call(
-                                self.exchange.create_order,
-                                symbol,
-                                "market",
-                                close_side,
-                                float(qty),
-                                None,
-                                params={"reduceOnly": True, "category": "linear", "positionIdx": int(pos_idx)},
-                                tag=f"time_stop_close:{symbol}",
-                                sem=sem,
-                            )
-                            return
-            except Exception:
-                pass
-
             # -------- 클라이언트 SL 체크 (서버 SL 미작동 대비 백업) --------
             try:
                 ref_sl = float(self.initial_sl_map.get(key) or 0.0)
