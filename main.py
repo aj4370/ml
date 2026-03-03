@@ -2334,7 +2334,7 @@ class AsyncTradingBot:
             if qty <= 0:
                 return
 
-            params = {"reduceOnly": True}
+            params = {"reduceOnly": True, "category": "linear"}
             if pos_idx is not None:
                 params["positionIdx"] = int(pos_idx)
 
@@ -2956,8 +2956,17 @@ class AsyncTradingBot:
             params = {"category": "linear", "symbol": raw_s, "positionIdx": int(pos_idx)}
 
             if sl_price is not None and float(sl_price) > 0:
-                params["stopLoss"] = str(self.exchange.price_to_precision(symbol, float(sl_price)))
-                params["slTriggerBy"] = "LastPrice"
+                sl_str = str(self.exchange.price_to_precision(symbol, float(sl_price)))
+                # price_to_precision이 0을 반환하면 SL이 거래소에서 해제됨 → 마이크로코인 보정
+                if float(sl_str) <= 0:
+                    for sig in range(1, 16):
+                        sl_fallback = round(float(sl_price), sig)
+                        if sl_fallback > 0:
+                            sl_str = f"{sl_fallback:.{sig}f}"
+                            break
+                if float(sl_str) > 0:
+                    params["stopLoss"] = sl_str
+                    params["slTriggerBy"] = "LastPrice"
 
             if ts_dist is not None and float(ts_dist) > 0:
                 ts_raw = float(ts_dist)
@@ -2971,26 +2980,24 @@ class AsyncTradingBot:
                             break
                 params["trailingStop"] = ts_str
 
-            if hasattr(self.exchange, "privatePostV5PositionTradingStop"):
-                await self._api_call(
-                    self.exchange.privatePostV5PositionTradingStop,
-                    params,
-                    tag=f"v5_trading_stop:{symbol}",
-                    sem=use_sem,
-                )
-            elif hasattr(self.exchange, "privatePostV5PositionSetTradingStop"):
-                await self._api_call(
-                    self.exchange.privatePostV5PositionSetTradingStop,
-                    params,
-                    tag=f"v5_set_trading_stop:{symbol}",
-                    sem=use_sem,
-                )
+            # 설정할 항목이 없으면 API 호출 스킵
+            if "stopLoss" not in params and "trailingStop" not in params:
+                return True
+
+            # ccxt Bybit 4.x: privatePostV5PositionTradingStop
+            # 구버전 fallback: privatePostV5PositionSetTradingStop
+            fn = (
+                getattr(self.exchange, "privatePostV5PositionTradingStop", None)
+                or getattr(self.exchange, "privatePostV5PositionSetTradingStop", None)
+            )
+            if fn is not None:
+                await self._api_call(fn, params, tag=f"v5_trading_stop:{symbol}", sem=use_sem)
             else:
-                # ccxt Bybit 버전에 따라 메서드명이 다를 수 있음 - 직접 API 호출
                 write_log(ERROR_LOG_FILE,
                     f"[SL_METHOD_MISSING] {symbol} privatePostV5PositionTradingStop 없음 - "
                     "ccxt Bybit 버전 확인 필요. SL 미설정!")
                 self.queue_notify(f"[SL_WARN] {symbol} SL API 메서드 없음 - ccxt 버전 확인 필요")
+                return False
 
             return True
 
@@ -3555,7 +3562,7 @@ class AsyncTradingBot:
             if current_contracts <= 0:
                 return
 
-            pnl_usdt = self._get_pos_num(pos, "unrealisedPnl", "unrealised_pnl", default=0.0)
+            pnl_usdt = self._get_pos_num(pos, "unrealizedPnl", "unrealisedPnl", "unrealised_pnl", default=0.0)
             if pnl_usdt <= 0:
                 return
 
@@ -3614,8 +3621,13 @@ class AsyncTradingBot:
                 return False
 
             # ccxt 통합(American) + Bybit V5 raw(British) 둘 다 시도
-            pnl_val = self._get_pos_num(
-                pos, "unrealizedPnl", "unrealisedPnl", "unrealised_pnl", default=None)
+            # default=None 사용 시 _get_pos_num이 TypeError 유발 가능 → try/except 래핑
+            pnl_val = None
+            try:
+                pnl_val = self._get_pos_num(
+                    pos, "unrealizedPnl", "unrealisedPnl", "unrealised_pnl", default=None)
+            except Exception:
+                pnl_val = None
 
             # API 응답에 PnL 필드 없으면 curr_p로 직접 계산
             if pnl_val is None and float(curr_p) > 0:
