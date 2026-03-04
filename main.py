@@ -3226,22 +3226,13 @@ class AsyncTradingBot:
                                             symbol, sl_price=float(curr_sl), ts_dist=None,
                                             pos_idx=int(pos_idx), sem=sem)
                                     else:
-                                        # ST가 이미 curr_p를 넘어선 위험 상태 → 시장가 강제청산
-                                        qty_rec = abs(self._get_pos_num(pos, "contracts", "size", default=0.0))
-                                        if qty_rec > 0:
-                                            close_side_rec = self._close_side_for_pos(pos)
-                                            write_log(ERROR_LOG_FILE,
-                                                f"[SL_NO_RECOVERY] {symbol} {'LONG' if is_long else 'SHORT'} "
-                                                f"SL 복구 불가(st={st_rec:.6g} vs curr_p={curr_p:.6g}) → 시장가 청산")
-                                            self.queue_notify(
-                                                f"[SL_NO_RECOVERY] {symbol} SL 복구 불가 → 시장가 강제청산")
-                                            await self._api_call(
-                                                self.exchange.create_order,
-                                                symbol, "market", close_side_rec, float(qty_rec), None,
-                                                params={"reduceOnly": True, "category": "linear",
-                                                        "positionIdx": int(pos_idx)},
-                                                tag=f"sl_no_recovery_close:{symbol}", sem=sem)
-                                            return
+                                        # ST가 curr_p 반대편(LONG인데 ST > curr_p 등)
+                                        # → SL 설정 불가, 로그만 남기고 스킵
+                                        # ST플립 손절/하드스탑 등 다른 메커니즘이 별도로 처리
+                                        write_log(ERROR_LOG_FILE,
+                                            f"[SL_WARN] {symbol} {'LONG' if is_long else 'SHORT'} "
+                                            f"SL 재계산 불가(st={st_rec:.6g} curr_p={curr_p:.6g}) "
+                                            f"- ST방향 불일치, 스킵")
                     except Exception as e_rec:
                         write_log(ERROR_LOG_FILE, f"[SL_CALC_RECOVERY_ERR] {symbol}: {e_rec}")
 
