@@ -3092,10 +3092,10 @@ class AsyncTradingBot:
             sem = self.exit_sem
 
             # -------- 방향 판별 --------
+            # ccxt Bybit: side="long"/"short"(unified) 또는 "buy"/"sell"(raw) 모두 처리
             side_raw = str(pos.get("side") or "").lower()
-            is_long = ("buy" in side_raw) if side_raw else True
             if side_raw:
-                is_long = ("buy" in side_raw)
+                is_long = ("buy" in side_raw or "long" in side_raw)
             else:
                 # fallback: contracts sign이 없는 경우가 많아서 기본 LONG
                 is_long = True
@@ -3751,7 +3751,7 @@ class AsyncTradingBot:
 
                         pos_idx = self._extract_position_idx(pos, default=0)
                         side_raw = str(pos.get("side") or "").lower()
-                        is_long = True if not side_raw else ("buy" in side_raw)
+                        is_long = ("buy" in side_raw or "long" in side_raw) if side_raw else True
 
                         qty = abs(self._get_pos_num(pos, "contracts", "size", default=0.0))
                         if qty <= 0:
