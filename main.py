@@ -3194,6 +3194,56 @@ class AsyncTradingBot:
                         pos_idx=int(pos_idx),
                         sem=sem,
                     )
+                else:
+                    # initial_sl_map 비어 있음(봇 재시작 등) → 현재 5m ST로 SL 재계산
+                    try:
+                        df5_rec = await self.data_manager.fetch_timeframe_data(symbol, "5m", limit=60)
+                        if df5_rec is not None and len(df5_rec) >= 20:
+                            try:
+                                pack_rec = {"5m": df5_rec.copy()}
+                                pack_rec = TechnicalAnalyzer.add_indicators(pack_rec)
+                                df5_rec = pack_rec["5m"]
+                            except Exception:
+                                pass
+                            if "st" in df5_rec.columns:
+                                st_rec = float(df5_rec["st"].iloc[-1] or 0.0)
+                                if st_rec > 0:
+                                    # 유효한 SL: LONG은 ST < curr_p, SHORT은 ST > curr_p
+                                    if is_long and st_rec < curr_p:
+                                        curr_sl = st_rec
+                                    elif not is_long and st_rec > curr_p:
+                                        curr_sl = st_rec
+
+                                    if curr_sl > 0:
+                                        # 다음 사이클에서도 재활용할 수 있도록 맵에 등록
+                                        self.initial_sl_map[key] = curr_sl
+                                        write_log(ERROR_LOG_FILE,
+                                            f"[SL_CALC_RECOVERY] {symbol} {'LONG' if is_long else 'SHORT'} "
+                                            f"5m ST 재계산 복구 → {curr_sl:.6g}")
+                                        self.queue_notify(
+                                            f"[SL_CALC_RECOVERY] {symbol} SL 재계산 복구 → {curr_sl:.6g} (5m ST)")
+                                        await self.apply_exchange_v5_trading_stop(
+                                            symbol, sl_price=float(curr_sl), ts_dist=None,
+                                            pos_idx=int(pos_idx), sem=sem)
+                                    else:
+                                        # ST가 이미 curr_p를 넘어선 위험 상태 → 시장가 강제청산
+                                        qty_rec = abs(self._get_pos_num(pos, "contracts", "size", default=0.0))
+                                        if qty_rec > 0:
+                                            close_side_rec = self._close_side_for_pos(pos)
+                                            write_log(ERROR_LOG_FILE,
+                                                f"[SL_NO_RECOVERY] {symbol} {'LONG' if is_long else 'SHORT'} "
+                                                f"SL 복구 불가(st={st_rec:.6g} vs curr_p={curr_p:.6g}) → 시장가 청산")
+                                            self.queue_notify(
+                                                f"[SL_NO_RECOVERY] {symbol} SL 복구 불가 → 시장가 강제청산")
+                                            await self._api_call(
+                                                self.exchange.create_order,
+                                                symbol, "market", close_side_rec, float(qty_rec), None,
+                                                params={"reduceOnly": True, "category": "linear",
+                                                        "positionIdx": int(pos_idx)},
+                                                tag=f"sl_no_recovery_close:{symbol}", sem=sem)
+                                            return
+                    except Exception as e_rec:
+                        write_log(ERROR_LOG_FILE, f"[SL_CALC_RECOVERY_ERR] {symbol}: {e_rec}")
 
             # -------- 5m SuperTrend 기반 SL 추적 --------
             desired_sl = None
