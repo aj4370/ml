@@ -188,7 +188,7 @@ class Config:
     # 공통 필터에서 BB 확장(30m/1h)을 '필수'로 강제할지 여부
     # - 기본 False: (기존 동작 유지) BB 확장은 참고용 메시지로만 사용
     # - True: 공통필터 통과에 BB 확장도 필요
-    REQUIRE_COMMON_BB_EXPAND = False
+    REQUIRE_COMMON_BB_EXPAND = True  # 30m 또는 1h BB조개 필수
 
     ZIGZAG_LEFT_BARS = 5
     ZIGZAG_RIGHT_BARS = 2
@@ -3208,20 +3208,27 @@ class AsyncTradingBot:
                             if "st" in df5_rec.columns:
                                 st_rec = float(df5_rec["st"].iloc[-1] or 0.0)
                                 if st_rec > 0:
+                                    atr_rec = float(df5_rec["atr"].iloc[-1] or 0.0) if "atr" in df5_rec.columns else 0.0
+                                    atr_k_rec = float(getattr(Config, "ATR_SL_5M_K", 0.20) or 0.20)
                                     # 유효한 SL: LONG은 ST < curr_p, SHORT은 ST > curr_p
-                                    if is_long and st_rec < curr_p:
-                                        curr_sl = st_rec
-                                    elif not is_long and st_rec > curr_p:
-                                        curr_sl = st_rec
+                                    if is_long:
+                                        sl_rec_buffered = (st_rec - atr_rec * atr_k_rec) if atr_rec > 0 else st_rec
+                                        if sl_rec_buffered < curr_p:
+                                            curr_sl = sl_rec_buffered
+                                    elif not is_long:
+                                        sl_rec_buffered = (st_rec + atr_rec * atr_k_rec) if atr_rec > 0 else st_rec
+                                        if sl_rec_buffered > curr_p:
+                                            curr_sl = sl_rec_buffered
 
                                     if curr_sl > 0:
                                         # 다음 사이클에서도 재활용할 수 있도록 맵에 등록
                                         self.initial_sl_map[key] = curr_sl
                                         write_log(ERROR_LOG_FILE,
                                             f"[SL_CALC_RECOVERY] {symbol} {'LONG' if is_long else 'SHORT'} "
-                                            f"5m ST 재계산 복구 → {curr_sl:.6g}")
+                                            f"5m ST+ATR버퍼 재계산 복구 → {curr_sl:.6g} "
+                                            f"(ST={st_rec:.6g} ATR={atr_rec:.6g} k={atr_k_rec})")
                                         self.queue_notify(
-                                            f"[SL_CALC_RECOVERY] {symbol} SL 재계산 복구 → {curr_sl:.6g} (5m ST)")
+                                            f"[SL_CALC_RECOVERY] {symbol} SL 재계산 복구 → {curr_sl:.6g} (5m ST±ATR*{atr_k_rec})")
                                         await self.apply_exchange_v5_trading_stop(
                                             symbol, sl_price=float(curr_sl), ts_dist=None,
                                             pos_idx=int(pos_idx), sem=sem)
@@ -3254,34 +3261,36 @@ class AsyncTradingBot:
                     if "st" in df.columns and "st_dir" in df.columns:
                         st = float(df["st"].iloc[-1] or 0.0)
                         st_dir = int(df["st_dir"].iloc[-1] or 0)
+                        atr_sl = float(df["atr"].iloc[-1] or 0.0) if "atr" in df.columns else 0.0
+                        atr_k = float(getattr(Config, "ATR_SL_5M_K", 0.20) or 0.20)
 
                         if is_long:
                             # 롱: ST 방향==1(상승) 일 때만 SL 재설정
-                            # 방향이 -1로 바뀌면 재설정 금지 (SL을 아래로 내리는 건 무의미)
                             if st > 0 and st_dir == 1:
-                                desired_sl = st  # ST선 직접 사용
+                                # SL 재설정 = ST - ATR*k (ST보다 약간 낮게, 예민한 털림 방지)
+                                desired_sl = (st - atr_sl * atr_k) if atr_sl > 0 else st
                                 # 유리하게만(올릴 때만): 현재 SL보다 높고 현재가보다 낮아야
                                 if desired_sl > 0 and (curr_sl <= 0 or (desired_sl > curr_sl and desired_sl < curr_p)):
                                     curr_sl = float(desired_sl)
                                     write_log(ERROR_LOG_FILE,
-                                        f"[SL_UPDATE] {symbol} LONG SL→{curr_sl:.6g} (ST={st:.6g})")
+                                        f"[SL_UPDATE] {symbol} LONG SL→{curr_sl:.6g} (ST={st:.6g} ATR={atr_sl:.6g})")
                                     self.queue_notify(
-                                        f"[SL_UPDATE] {symbol} LONG SL 재설정 → {curr_sl:.6g} (ST14,3)")
+                                        f"[SL_UPDATE] {symbol} LONG SL 재설정 → {curr_sl:.6g} (ST-ATR*{atr_k})")
                                     await self.apply_exchange_v5_trading_stop(
                                         symbol, sl_price=float(curr_sl), ts_dist=None,
                                         pos_idx=int(pos_idx), sem=sem)
                         else:
                             # 숏: ST 방향==-1(하락) 일 때만 SL 재설정
-                            # 방향이 +1로 바뀌면 재설정 금지 (SL을 위로 올리는 건 무의미)
                             if st > 0 and st_dir == -1:
-                                desired_sl = st  # ST선 직접 사용
+                                # SL 재설정 = ST + ATR*k (ST보다 약간 높게, 예민한 털림 방지)
+                                desired_sl = (st + atr_sl * atr_k) if atr_sl > 0 else st
                                 # 유리하게만(내릴 때만): 현재 SL보다 낮고 현재가보다 높아야
                                 if desired_sl > 0 and (curr_sl <= 0 or (desired_sl < curr_sl and desired_sl > curr_p)):
                                     curr_sl = float(desired_sl)
                                     write_log(ERROR_LOG_FILE,
-                                        f"[SL_UPDATE] {symbol} SHORT SL→{curr_sl:.6g} (ST={st:.6g})")
+                                        f"[SL_UPDATE] {symbol} SHORT SL→{curr_sl:.6g} (ST={st:.6g} ATR={atr_sl:.6g})")
                                     self.queue_notify(
-                                        f"[SL_UPDATE] {symbol} SHORT SL 재설정 → {curr_sl:.6g} (ST14,3)")
+                                        f"[SL_UPDATE] {symbol} SHORT SL 재설정 → {curr_sl:.6g} (ST+ATR*{atr_k})")
                                     await self.apply_exchange_v5_trading_stop(
                                         symbol, sl_price=float(curr_sl), ts_dist=None,
                                         pos_idx=int(pos_idx), sem=sem)
@@ -3334,7 +3343,7 @@ class AsyncTradingBot:
 
 
 
-    async def execute_aggressive_order(self, symbol, side, qty, note, total_bal, sl_p=None, depth=None, price_hint=None):
+    async def execute_aggressive_order(self, symbol, side, qty, note, total_bal, sl_p=None, sl_lev_p=None, depth=None, price_hint=None):
         """
         [교체 버전]
         - ENTRY가 찍혔는데 주문 단계가 안 보이는 문제를 강제로 드러내고(에러 텔레그램),
@@ -3419,10 +3428,12 @@ class AsyncTradingBot:
 
                     curr_m2 = self._estimate_position_margin(pos_before, curr_price=float(target_p))
 
+                    # 레버리지 재산출: sl_lev_p(ST선 기준) 우선, 없으면 sl_sanitized
+                    _lev_sl = float(sl_lev_p) if (sl_lev_p and float(sl_lev_p) > 0) else float(sl_sanitized)
                     lev2, qty2, _ = RiskManager.calculate_entry_params(
                         float(total_bal),
                         float(target_p),
-                        float(sl_sanitized),
+                        float(_lev_sl),
                         float(max_lev2),
                         current_m=float(curr_m2 or 0.0),
                         leverage_step=float(lev_step2),
@@ -3914,7 +3925,7 @@ class AsyncTradingBot:
 
                 entry_price = float(df5["close"].iloc[-1])
 
-                # SL sanitize
+                # ── sl_final(ST선): 레버리지 산정 기준 ──
                 sl_final = float(entry_sl or 0.0)
                 if sl_final <= 0:
                     return
@@ -3926,7 +3937,27 @@ class AsyncTradingBot:
                     sl_final = float(self._sanitize_short_sl(entry_price, sl_final, min_gap_pct=0.002))
                     order_side = "sell"
 
-                # 레버리지/수량 산정
+                # ── sl_exchange: 실제 거래소 SL (ATR 버퍼 + 진입봉 저/고가 고려) ──
+                # LONG: min(진입봉 저가, ST - ATR*k)  → ST보다 낮게, 너무 예민하지 않게
+                # SHORT: max(진입봉 고가, ST + ATR*k) → ST보다 높게, 너무 예민하지 않게
+                try:
+                    atr_k = float(getattr(Config, "ATR_SL_5M_K", 0.20) or 0.20)
+                    atr_5m = float(df5["atr"].iloc[-1] or 0.0) if "atr" in df5.columns else 0.0
+                    buf = atr_5m * atr_k
+                    if side == "long":
+                        l_entry = float(df5["low"].iloc[-1])
+                        sl_exchange = min(l_entry, sl_final - buf) if buf > 0 else sl_final
+                        sl_exchange = float(self._sanitize_long_sl(entry_price, sl_exchange, min_gap_pct=0.002))
+                    else:
+                        h_entry = float(df5["high"].iloc[-1])
+                        sl_exchange = max(h_entry, sl_final + buf) if buf > 0 else sl_final
+                        sl_exchange = float(self._sanitize_short_sl(entry_price, sl_exchange, min_gap_pct=0.002))
+                    if sl_exchange <= 0:
+                        sl_exchange = sl_final
+                except Exception:
+                    sl_exchange = sl_final
+
+                # 레버리지/수량 산정 (sl_final = ST선 기준 유지)
                 try:
                     max_lev = await self.get_symbol_max_leverage(symbol)
                     lev_step = await self.get_symbol_leverage_step(symbol)
@@ -3939,7 +3970,7 @@ class AsyncTradingBot:
                 lev, qty, needed_m = RiskManager.calculate_entry_params(
                     float(total_bal),        # 사이즈 계산은 총 잔고 기준 유지
                     float(entry_price),
-                    float(sl_final),
+                    float(sl_final),         # 레버리지는 ST선 기준
                     float(max_lev),
                     current_m=float(curr_m or 0.0),
                     leverage_step=float(lev_step),
@@ -3975,19 +4006,21 @@ class AsyncTradingBot:
                     self.queue_notify(f"[COMMON_OK] {symbol}\n{common_msg}")
 
                 self.queue_notify(
-                    f"[ENTRY] {symbol} {note}\nP:{entry_price:.6f} SL:{sl_final:.6f} lev:{lev} qty:{qty}"
+                    f"[ENTRY] {symbol} {note}\nP:{entry_price:.6f} "
+                    f"SL_lev:{sl_final:.6f} SL_ex:{sl_exchange:.6f} lev:{lev} qty:{qty}"
                 )
 
-                # 주문 집행(진입 후 SL 서버등록)
+                # 주문 집행 (sl_lev_p=ST선 레버리지 기준, sl_p=실제 거래소 SL)
                 await self.execute_aggressive_order(
                     symbol,
                     order_side,
                     qty,
                     note,
                     total_bal,
-                    sl_p=float(sl_final),
+                    sl_p=float(sl_exchange),
+                    sl_lev_p=float(sl_final),
                     depth=None,
-                    price_hint=float(entry_price),  # 오더북 실패 시 fallback 가격
+                    price_hint=float(entry_price),
                 )
 
             except Exception as e:
