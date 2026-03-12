@@ -144,8 +144,8 @@ class Config:
     TIME_STOP_BARS = 24                # 24봉 = 2시간 (8봉=40분은 너무 짧아 완화)
     TIME_STOP_PROGRESS_ATR_MULT = 0.3  # 진행 기준 완화: trail_pct * 0.3 (기존 0.5)
 
-    # [NEW] SHORT 사용 여부
-    ENABLE_SHORT = True
+    # [NEW] SHORT 사용 여부 (숏 실행 완전 비활성화)
+    ENABLE_SHORT = False
 
     EMA_FAST = 20  # EMA20
     EMA_SLOW = 60  # EMA60
@@ -4117,9 +4117,10 @@ class AsyncTradingBot:
                     if l_ok and not s_ok:
                         ent_candidates.append((sym, l_msg, "long"))
                         long_cnt += 1
-                    elif s_ok and not l_ok and enable_short:
-                        ent_candidates.append((sym, s_msg, "short"))
-                        short_cnt += 1
+                    # --- 숏 매수 실행 비활성화 (전략/지표 코드는 유지) ---
+                    # elif s_ok and not l_ok and enable_short:
+                    #     ent_candidates.append((sym, s_msg, "short"))
+                    #     short_cnt += 1
                     # 둘 다 True거나 둘 다 False면 스킵
 
                 if not ent_candidates:
@@ -4132,7 +4133,8 @@ class AsyncTradingBot:
                 self._loop_cnt += 1
                 if self._loop_cnt % 10 == 1:
                     self.queue_notify(
-                        f"[SCAN] long_cand={long_cnt} short_cand={short_cnt} "
+                        f"[SCAN] long_cand={long_cnt} "
+                        # f"short_cand={short_cnt} "  # 숏 알람 비활성화
                         f"total={len(ent_candidates)}/{len(sym_list)}"
                     )
 
