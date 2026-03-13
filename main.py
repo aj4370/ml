@@ -493,6 +493,13 @@ class DataManager:
         """호환용(미사용): Config.TIMEFRAMES 전체 fetch"""
         return await self.fetch_timeframes(symbol, Config.TIMEFRAMES, limit=limit)
 
+    async def fetch_timeframe_data(self, symbol, timeframe, limit=300):
+        """단일 타임프레임 DataFrame 반환"""
+        result = await self.fetch_timeframes(symbol, [timeframe], limit=limit)
+        if result is None:
+            return None
+        return result.get(timeframe)
+
     async def get_target_price_by_orderbook(self, symbol, side, depth_step=5):
         """오더북 기반 목표가 산출 (동시성 제한 적용)"""
         try:
@@ -1149,7 +1156,7 @@ class TechnicalAnalyzer:
             df5 = ohlcvs_dict.get("5m")
             df15 = ohlcvs_dict.get("15m")
 
-            if df1 is None or df5 is None or df15 is None:
+            if df1 is None or df5 is None:
                 return False, False, 0.0, "", "", "", {}
 
             # 5m 지표
