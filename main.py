@@ -3139,15 +3139,27 @@ class AsyncTradingBot:
                 await asyncio.sleep(300)
 
                 strong_items = list(self.found_strong_symbols.items())
-                msg = f"[5M 리포트] 강세 감시 종목 요약 ({len(strong_items)}개)\n"
+
+                # 캐시 상태 집계
+                cf = getattr(self, "common_filter_cache", None)
+                cache_total = len(cf._cache) if cf else 0
+                cache_pass = sum(1 for v in cf._cache.values() if v[0]) if cf else 0
+
+                async with self.candidate_lock:
+                    cand_n = len(self.candidate_symbols or [])
+
+                msg = (
+                    f"[5M 리포트] 공통필터 통과 {len(strong_items)}개\n"
+                    f"캐시: {cache_total}/{cand_n}개 적재 | 통과: {cache_pass}개\n"
+                )
 
                 if strong_items:
-                    for sym, info in strong_items[:50]:
-                        msg += f"{sym}: {info}\n"
-                    if len(strong_items) > 50:
-                        msg += f"... (생략: {len(strong_items)-50}개)\n"
+                    for sym, info in strong_items[:30]:
+                        msg += f"  {sym}: {info}\n"
+                    if len(strong_items) > 30:
+                        msg += f"  ... (생략: {len(strong_items)-30}개)\n"
                 else:
-                    msg += "현재 조건 만족 종목 없음\n"
+                    msg += "현재 공통조건 만족 종목 없음\n"
 
                 self.queue_notify(message=msg)
                 self.found_strong_symbols.clear()
@@ -4249,6 +4261,10 @@ class AsyncTradingBot:
                     for sym, (l_ok, s_ok, l_msg, s_msg) in common_map.items()
                     if l_ok
                 ]
+
+                # 공통조건 통과 심볼 → 리포트용 기록
+                for sym, msg in eligible:
+                    self.found_strong_symbols[sym] = msg
 
                 if not eligible:
                     await asyncio.sleep(Config.MAIN_LOOP_SEC)
