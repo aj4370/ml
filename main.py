@@ -744,8 +744,20 @@ class OhlcvStreamManager:
                         if raw_k == raw_sym:
                             matched_key = key
                             break
+
+                if matched_key is None:
+                    # 캐시 없음: 구독은 됐으나 REST 초기화 전 → 임시 빈 캐시 생성
+                    for key in self._subscribed:
+                        sym_key, tf_key = key
+                        if tf_key == tf:
+                            raw_k = sym_key.replace("/", "").replace(":USDT", "").replace(":USD", "")
+                            if raw_k == raw_sym:
+                                matched_key = key
+                                self._cache[key] = deque(maxlen=self._max_bars)
+                                break
                 if matched_key is None:
                     return
+
                 dq = self._cache[matched_key]
                 for candle in data_list:
                     ts = int(candle.get("start", 0))
@@ -1425,7 +1437,7 @@ class TechnicalAnalyzer:
     @staticmethod
     def _check_signals_sync(ohlcvs_dict, side: str = "long"):
         """
-        엔트리 시그널 - Buy_1M_ST14_3_Touch (1분봉 슈퍼트렌드 터치)
+        엔트리 시그널 - Buy_1M_ST10_2_Touch (1분봉 슈퍼트렌드 터치)
         AND 조건:
           1) 5m BB 현재봉 상하 모두 확장 (이전봉 대비)
           2) 5m RSI > 70
@@ -1504,7 +1516,7 @@ class TechnicalAnalyzer:
 
                 if cond_bb5_expand and cond_rsi5 and cond_st1_dir and cond_touch and cond_bull_prev and cond_bull_now:
                     sl_raw = max(min(l1_now, l1_prev), st1_now)
-                    return True, full_exit, float(sl_raw), "Buy_1M_ST14_3_Touch", "ST_1m", common_msg, details
+                    return True, full_exit, float(sl_raw), "Buy_1M_ST10_2_Touch", "ST_1m", common_msg, details
 
                 return False, full_exit, 0.0, "", "", "", details
 
@@ -3405,7 +3417,7 @@ class AsyncTradingBot:
                     )
 
             # -------- ST 기반 SL 추적 (전략별 분기) --------
-            # Buy_1M_ST14_3_Touch: 1m ST 기반 (ATR 버퍼 0.2)
+            # Buy_1M_ST10_2_Touch: 1m ST 기반 (ATR 버퍼 0.2)
             # 기타: 5m ST 기반
             desired_sl = None
             strategy_note = str(self.entry_strategy_map.get(key, "") or "")
@@ -4266,7 +4278,7 @@ async def _main_async():
     try:
         start_msg = (
             f"[BOT START] mode={'TESTNET' if Config.IS_TEST_MODE else 'REAL'} | "
-            f"strategy=Buy_1M_ST14_3_Touch | stream=ON | loop={Config.MAIN_LOOP_SEC}s | "
+            f"strategy=Buy_1M_ST10_2_Touch | stream=ON | loop={Config.MAIN_LOOP_SEC}s | "
             f"universe={len(getattr(bot, 'universe_symbols', []) or [])} "
             f"candidates={len(getattr(bot, 'candidate_symbols', []) or [])}"
         )
