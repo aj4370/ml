@@ -813,14 +813,15 @@ class CommonFilterCache:
         except Exception as e:
             write_log(ERROR_LOG_FILE, f"[CF_CACHE] {symbol} 갱신 실패: {e}")
 
-    async def update_all(self, symbols: list):
-        # 현재 symbols에 없는 오래된 항목 제거 (캐시 무한 증가 방지)
+    async def prune(self, symbols: list):
+        """전체 심볼 목록 기준으로 캐시 정리 (목록에 없는 항목 삭제)"""
         sym_set = set(symbols)
         async with self._lock:
             obsolete = [k for k in list(self._cache.keys()) if k not in sym_set]
             for k in obsolete:
                 del self._cache[k]
 
+    async def update_all(self, symbols: list):
         now = time.time()
         stale = [s for s in symbols if (
             self._cache.get(s) is None or (now - self._cache[s][4]) > self._ttl
@@ -4341,6 +4342,7 @@ async def _main_async():
                     async with bot.candidate_lock:
                         syms = list(bot.candidate_symbols or [])
                     if syms:
+                        await cf.prune(syms)   # 전체 목록 기준으로 불필요 항목 삭제
                         await cf.update_all(syms)
                         if bot.stream_manager is not None:
                             await bot.stream_manager.update_subscriptions(syms)
