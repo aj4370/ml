@@ -814,6 +814,13 @@ class CommonFilterCache:
             write_log(ERROR_LOG_FILE, f"[CF_CACHE] {symbol} 갱신 실패: {e}")
 
     async def update_all(self, symbols: list):
+        # 현재 symbols에 없는 오래된 항목 제거 (캐시 무한 증가 방지)
+        sym_set = set(symbols)
+        async with self._lock:
+            obsolete = [k for k in list(self._cache.keys()) if k not in sym_set]
+            for k in obsolete:
+                del self._cache[k]
+
         now = time.time()
         stale = [s for s in symbols if (
             self._cache.get(s) is None or (now - self._cache[s][4]) > self._ttl
@@ -1292,10 +1299,22 @@ class TechnicalAnalyzer:
                     msg += f" | {bb_msg}"
                 return True, msg
 
-            return False, ""
+            # 디버그: 첫 통과 실패 시 이유를 간략히 반환 (진단용)
+            fail_reasons = []
+            if not cond_rsi_strong:
+                fail_reasons.append(f"RSI({r30:.1f}/{r1:.1f})<70")
+            if not cond_bb:
+                fail_reasons.append("BB15_no_expand")
+            if not cond_macd:
+                fail_reasons.append(f"MACD({m30_h:.4f}/{m1_h:.4f})<=0")
+            if not cond_vol:
+                fail_reasons.append("VOL<MA20")
+            if not cond_adx:
+                fail_reasons.append("ADX_weak")
+            return False, "|".join(fail_reasons)
 
-        except Exception:
-            return False, ""
+        except Exception as e:
+            return False, f"ERR:{e}"
 
     @staticmethod
     def _check_common_conditions_sync_short(dfs_common):
@@ -3154,6 +3173,13 @@ class AsyncTradingBot:
                         msg += f"  ... (생략: {len(strong_items)-30}개)\n"
                 else:
                     msg += "현재 공통조건 만족 종목 없음\n"
+                    # 실패 이유 샘플 (최대 5개)
+                    if cf and cf._cache:
+                        fail_samples = [(s, v[2]) for s, v in list(cf._cache.items())[:5] if not v[0] and v[2]]
+                        if fail_samples:
+                            msg += "실패사유 샘플:\n"
+                            for s, reason in fail_samples:
+                                msg += f"  {s}: {reason}\n"
 
                 self.queue_notify(message=msg)
                 self.found_strong_symbols.clear()
