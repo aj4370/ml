@@ -3932,7 +3932,55 @@ class AsyncTradingBot:
                         if curr_p <= 0:
                             continue
 
-                        # 5m 데이터로 EMA20 확인(긴급청산)
+                        # ── 1m ST 하향 돌파 손절 (Buy_1M 전략 전용) ──────────────
+                        strategy_note = str(self.entry_strategy_map.get((symbol, int(pos_idx)), "") or "")
+                        use_1m_exit = ("Buy_1M" in strategy_note or "1M_ST" in strategy_note)
+                        if use_1m_exit and is_long:
+                            df1_ex = None
+                            sm = getattr(self, "stream_manager", None)
+                            if sm is not None:
+                                df1_ex = await sm.get_df(symbol, "1m")
+                            if df1_ex is None or len(df1_ex) < 5:
+                                df1_ex = await self.data_manager.fetch_timeframe_data(symbol, "1m", limit=60)
+                            if df1_ex is not None and len(df1_ex) >= 5:
+                                try:
+                                    pk1 = {"1m": df1_ex.copy()}
+                                    pk1 = TechnicalAnalyzer.add_indicators(pk1)
+                                    df1_ex = pk1["1m"]
+                                except Exception:
+                                    pass
+                                try:
+                                    if "st" in df1_ex.columns and "st_dir" in df1_ex.columns:
+                                        c_prev1 = float(df1_ex["close"].iloc[-2])
+                                        c_now1  = float(df1_ex["close"].iloc[-1])
+                                        st_prev1 = float(df1_ex["st"].iloc[-2] or 0.0)
+                                        st_now1  = float(df1_ex["st"].iloc[-1] or 0.0)
+                                        dir_now1 = int(df1_ex["st_dir"].iloc[-1] or 0)
+                                        # 조건: 이전봉 종가 < 이전봉 ST (돌파 마감)
+                                        #       AND 현재봉도 ST 아래 (dir == -1 or close < st)
+                                        prev_broke = (st_prev1 > 0 and c_prev1 < st_prev1)
+                                        curr_below = (dir_now1 != 1) or (st_now1 > 0 and c_now1 < st_now1)
+                                        if prev_broke and curr_below:
+                                            close_side = self._close_side_for_pos(pos)
+                                            self.queue_notify(
+                                                f"[EXIT_1M_ST] {symbol} LONG | "
+                                                f"prev_c={c_prev1:.6g} < ST={st_prev1:.6g} | "
+                                                f"curr_c={c_now1:.6g} ST={st_now1:.6g} dir={dir_now1} | "
+                                                f"qty={qty} P={curr_p}"
+                                            )
+                                            await self._api_call(
+                                                self.exchange.create_order,
+                                                symbol, "market", close_side, float(qty), None,
+                                                params={"reduceOnly": True, "category": "linear",
+                                                        "positionIdx": int(pos_idx)},
+                                                tag=f"exit_1m_st:{symbol}",
+                                                sem=self.exit_sem,
+                                            )
+                                            continue
+                                except Exception:
+                                    pass
+
+                        # ── 5m EMA20 긴급청산 ─────────────────────────────────────
                         df5 = await self.data_manager.fetch_timeframe_data(symbol, "5m", limit=120)
                         if df5 is None or len(df5) < 30:
                             # 데이터 부족이면 SL/TS만 관리
