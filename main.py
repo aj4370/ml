@@ -87,9 +87,22 @@ class Config:
     BATCH_SIZE = 10  # 병렬 처리 단위
 
     # [메인 루프] 주기/배치/레버리지 상한
-    MAIN_LOOP_SEC = 10
+    MAIN_LOOP_SEC = 1.0          # 1m봉 매매: 1초 루프
+    SCAN_DELAY = 0.0             # 루프 배치 간 딜레이 없음
     MAIN_BATCH_SIZE = 10
     MAX_LEVERAGE = 3.0
+
+    # [WebSocket 스트림] Bybit 실시간 kline
+    WS_BYBIT_REAL = "wss://stream.bybit.com/v5/public/linear"
+    WS_BYBIT_TEST = "wss://stream-testnet.bybit.com/v5/public/linear"
+    WS_MAX_BARS = 300
+    WS_PING_INTERVAL = 20
+    WS_RECONNECT_DELAY = 3
+    STREAM_TFS = ["1m", "5m"]
+
+    # [공통필터 캐시]
+    COMMON_FILTER_CACHE_TTL = 60.0
+    COMMON_FILTER_UPDATE_SEC = 5.0
 
 
     # [TF 구성]
@@ -500,6 +513,10 @@ class DataManager:
             return None
         return result.get(timeframe)
 
+    async def get_ohlcv_for_stream_init(self, symbol, tf, limit=300):
+        """스트림 초기 히스토리 로드용 (REST 단일 TF fetch)"""
+        return await self.fetch_timeframe_data(symbol, tf, limit=limit)
+
     async def get_target_price_by_orderbook(self, symbol, side, depth_step=5):
         """오더북 기반 목표가 산출 (동시성 제한 적용)"""
         try:
@@ -532,6 +549,269 @@ class DataManager:
             return None
         except Exception:
             return None
+
+
+# -----------------------------------------------------------
+# [모듈 3-B] OhlcvStreamManager - Bybit WebSocket 실시간 kline 캐시
+# -----------------------------------------------------------
+from collections import deque
+
+class OhlcvStreamManager:
+    """
+    Bybit WebSocket v5 kline 실시간 수신 + 내부 OHLCV 캐시 관리.
+    - 구독 TF: 1m, 5m (Config.STREAM_TFS)
+    - 초기 히스토리: REST로 로드 후 WS로 실시간 업데이트
+    - confirm=False(진행중봉): 마지막 봉을 덮어씀
+    - confirm=True(확정봉): 새 봉 추가 + 히스토리 유지(MAX_BARS)
+    - get_df(symbol, tf) → DataFrame or None
+    - 자동 재연결 (WS_RECONNECT_DELAY초 후)
+    """
+
+    _TF_INTERVAL = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "4h": "240"}
+    _INTERVAL_TF = {v: k for k, v in _TF_INTERVAL.items()}
+
+    def __init__(self, data_manager, is_testnet: bool = False):
+        self.data_manager = data_manager
+        self.ws_url = Config.WS_BYBIT_TEST if is_testnet else Config.WS_BYBIT_REAL
+        self._cache: dict = {}
+        self._cache_lock = asyncio.Lock()
+        self._subscribed: set = set()
+        self._running = False
+        self._ws_task = None
+        self._ws_ref = None
+        self._pending_subs: set = set()
+        self._hist_loaded: set = set()
+        self._max_bars = int(getattr(Config, "WS_MAX_BARS", 300))
+
+    async def start(self):
+        self._running = True
+        self._ws_task = asyncio.create_task(self._ws_loop(), name="ohlcv_stream")
+
+    async def stop(self):
+        self._running = False
+        if self._ws_task and not self._ws_task.done():
+            self._ws_task.cancel()
+            try:
+                await self._ws_task
+            except Exception:
+                pass
+
+    async def subscribe(self, symbols: list, tfs: list = None):
+        tfs = tfs or list(getattr(Config, "STREAM_TFS", ["1m", "5m"]))
+        async with self._cache_lock:
+            for sym in symbols:
+                for tf in tfs:
+                    key = (str(sym), str(tf))
+                    if key not in self._subscribed:
+                        self._pending_subs.add(key)
+
+    async def get_df(self, symbol: str, tf: str):
+        key = (str(symbol), str(tf))
+        async with self._cache_lock:
+            dq = self._cache.get(key)
+            if not dq or len(dq) < 10:
+                return None
+            rows = list(dq)
+        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df.sort_values("timestamp", inplace=True)
+        df.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    async def update_subscriptions(self, symbols: list):
+        await self.subscribe(symbols)
+
+    async def _ws_loop(self):
+        reconnect_delay = int(getattr(Config, "WS_RECONNECT_DELAY", 3))
+        while self._running:
+            try:
+                await self._connect_and_run()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                write_log(ERROR_LOG_FILE, f"[WS_STREAM] 연결 끊김, {reconnect_delay}초 후 재연결: {e}")
+                await asyncio.sleep(reconnect_delay)
+
+    async def _connect_and_run(self):
+        ping_interval = int(getattr(Config, "WS_PING_INTERVAL", 20))
+        timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=60)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.ws_connect(self.ws_url, heartbeat=ping_interval) as ws:
+                self._ws_ref = ws
+                write_log(ERROR_LOG_FILE, f"[WS_STREAM] 연결됨: {self.ws_url}")
+                async with self._cache_lock:
+                    existing = set(self._subscribed)
+                if existing:
+                    await self._send_subscribe(ws, existing)
+                sub_task = asyncio.create_task(self._sub_dispatcher(ws))
+                try:
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            await self._handle_message(msg.data)
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
+                finally:
+                    sub_task.cancel()
+                    try:
+                        await sub_task
+                    except Exception:
+                        pass
+
+    async def _sub_dispatcher(self, ws):
+        while self._running:
+            await asyncio.sleep(0.5)
+            if not self._pending_subs:
+                continue
+            async with self._cache_lock:
+                batch = set(self._pending_subs)
+                self._pending_subs.clear()
+            new_keys = batch - self._subscribed
+            if new_keys:
+                await self._send_subscribe(ws, new_keys)
+                async with self._cache_lock:
+                    self._subscribed |= new_keys
+            for key in new_keys:
+                sym, tf = key
+                if key not in self._hist_loaded:
+                    asyncio.create_task(self._load_history(sym, tf))
+
+    async def _send_subscribe(self, ws, keys: set):
+        args = []
+        for sym, tf in keys:
+            interval = self._TF_INTERVAL.get(tf)
+            if interval is None:
+                continue
+            raw_sym = sym.replace("/", "").replace(":USDT", "").replace(":USD", "")
+            args.append(f"kline.{interval}.{raw_sym}")
+        if not args:
+            return
+        for i in range(0, len(args), 10):
+            chunk = args[i:i+10]
+            msg = json.dumps({"op": "subscribe", "args": chunk})
+            try:
+                await ws.send_str(msg)
+            except Exception as e:
+                write_log(ERROR_LOG_FILE, f"[WS_STREAM] subscribe 실패: {e}")
+
+    async def _load_history(self, symbol: str, tf: str):
+        try:
+            df = await self.data_manager.get_ohlcv_for_stream_init(symbol, tf, limit=self._max_bars)
+            if df is None or df.empty:
+                return
+            rows = []
+            for _, row in df.iterrows():
+                ts = int(row["timestamp"].timestamp() * 1000) if hasattr(row["timestamp"], "timestamp") else int(row["timestamp"])
+                rows.append([ts, float(row["open"]), float(row["high"]),
+                             float(row["low"]), float(row["close"]), float(row["volume"])])
+            rows.sort(key=lambda x: x[0])
+            key = (symbol, tf)
+            async with self._cache_lock:
+                self._cache[key] = deque(rows, maxlen=self._max_bars)
+                self._hist_loaded.add(key)
+        except Exception as e:
+            write_log(ERROR_LOG_FILE, f"[WS_HIST] {symbol}/{tf} 초기 로드 실패: {e}")
+
+    async def _handle_message(self, raw: str):
+        try:
+            msg = json.loads(raw)
+            if msg.get("op") == "subscribe":
+                return
+            topic = msg.get("topic", "")
+            if not topic.startswith("kline."):
+                return
+            parts = topic.split(".")
+            if len(parts) < 3:
+                return
+            interval = parts[1]
+            raw_sym = parts[2]
+            tf = self._INTERVAL_TF.get(interval)
+            if tf is None:
+                return
+            data_list = msg.get("data", [])
+            if not data_list:
+                return
+            async with self._cache_lock:
+                matched_key = None
+                for key in self._cache:
+                    sym_key, tf_key = key
+                    if tf_key == tf:
+                        raw_k = sym_key.replace("/", "").replace(":USDT", "").replace(":USD", "")
+                        if raw_k == raw_sym:
+                            matched_key = key
+                            break
+                if matched_key is None:
+                    return
+                dq = self._cache[matched_key]
+                for candle in data_list:
+                    ts = int(candle.get("start", 0))
+                    o  = float(candle.get("open",   0))
+                    h  = float(candle.get("high",   0))
+                    l  = float(candle.get("low",    0))
+                    c  = float(candle.get("close",  0))
+                    v  = float(candle.get("volume", 0))
+                    confirm = bool(candle.get("confirm", False))
+                    if dq and dq[-1][0] == ts:
+                        dq[-1] = [ts, o, h, l, c, v]
+                    elif confirm or (not dq) or ts > dq[-1][0]:
+                        dq.append([ts, o, h, l, c, v])
+        except Exception:
+            pass
+
+
+# -----------------------------------------------------------
+# [모듈 3-C] CommonFilterCache - 공통필터 결과 캐시
+# -----------------------------------------------------------
+class CommonFilterCache:
+    """
+    심볼별 공통필터(4h/1h/30m/15m) 결과를 캐싱.
+    - TTL: Config.COMMON_FILTER_CACHE_TTL (기본 60초)
+    - 백그라운드 갱신 태스크(update_all)가 주기적으로 만료 항목 갱신
+    - get(symbol) → (long_ok, short_ok, msg_long, msg_short) or None
+    """
+
+    def __init__(self, data_manager):
+        self.data_manager = data_manager
+        self._cache: dict = {}
+        self._lock = asyncio.Lock()
+        self._ttl = float(getattr(Config, "COMMON_FILTER_CACHE_TTL", 60.0))
+
+    def get(self, symbol: str):
+        entry = self._cache.get(symbol)
+        if entry is None:
+            return None
+        long_ok, short_ok, msg_l, msg_s, ts = entry
+        if time.time() - ts > self._ttl:
+            return None
+        return long_ok, short_ok, msg_l, msg_s
+
+    async def refresh(self, symbol: str):
+        try:
+            dfs = await self.data_manager.fetch_common_data(symbol, limit=260)
+            if not dfs:
+                return
+            dfs = TechnicalAnalyzer.add_indicators(dfs)
+            l_ok, s_ok, l_msg, s_msg = await TechnicalAnalyzer.check_common_conditions_sides(dfs)
+            async with self._lock:
+                self._cache[symbol] = (bool(l_ok), bool(s_ok), str(l_msg), str(s_msg), time.time())
+        except Exception as e:
+            write_log(ERROR_LOG_FILE, f"[CF_CACHE] {symbol} 갱신 실패: {e}")
+
+    async def update_all(self, symbols: list):
+        now = time.time()
+        stale = [s for s in symbols if (
+            self._cache.get(s) is None or (now - self._cache[s][4]) > self._ttl
+        )]
+        if not stale:
+            return
+        batch_size = int(getattr(Config, "MAIN_BATCH_SIZE", 10))
+        for i in range(0, len(stale), batch_size):
+            chunk = stale[i:i+batch_size]
+            await asyncio.gather(*[self.refresh(s) for s in chunk], return_exceptions=True)
 
 
 # -----------------------------------------------------------
@@ -1145,123 +1425,90 @@ class TechnicalAnalyzer:
     @staticmethod
     def _check_signals_sync(ohlcvs_dict, side: str = "long"):
         """
-        엔트리 시그널 (5m)
-        - side: "long" or "short"
-        return:
-          (sig: bool, full_exit_sig: bool, entry_sl: float, strategy_name: str, sl_source: str, common_msg: str, details: dict)
+        엔트리 시그널 - Buy_1M_ST14_3_Touch (1분봉 슈퍼트렌드 터치)
+        AND 조건:
+          1) 5m BB 현재봉 상하 모두 확장 (이전봉 대비)
+          2) 5m RSI > 70
+          3) 1m ST 방향: 이전봉[-2] AND 현재봉[-1] 모두 +1
+          4) 1m 이전봉[-2] 저가 ≤ 1m ST + ATR*0.3 (터치 허용)
+          5) 1m 이전봉[-2] 양봉
+          6) 1m 현재봉[-1] 양봉 (진행 중)
+        초기 SL = max(min(현재1m저가, 이전1m저가), 1m_ST_현재)
+        return: (sig, full_exit_sig, entry_sl, strategy_name, sl_source, common_msg, details)
         """
         try:
             side = str(side or "long").lower().strip()
             df1 = ohlcvs_dict.get("1m")
             df5 = ohlcvs_dict.get("5m")
-            df15 = ohlcvs_dict.get("15m")
 
             if df1 is None or df5 is None:
                 return False, False, 0.0, "", "", "", {}
 
-            # 5m 지표
-            if "ema20" not in df5.columns or "atr" not in df5.columns or "st" not in df5.columns or "st_dir" not in df5.columns:
+            # 1m 필수 컬럼
+            for col in ("st", "st_dir", "atr", "rsi"):
+                if col not in df1.columns:
+                    return False, False, 0.0, "", "", "", {}
+            # 5m 필수 컬럼
+            for col in ("bb_upper", "bb_lower", "rsi"):
+                if col not in df5.columns:
+                    return False, False, 0.0, "", "", "", {}
+            if len(df1) < 5 or len(df5) < 5:
                 return False, False, 0.0, "", "", "", {}
 
-            # 현재가/최근캔들
-            c_now = float(df5["close"].iloc[-1])
-            o_now = float(df5["open"].iloc[-1])
-            h_now = float(df5["high"].iloc[-1])
-            l_now = float(df5["low"].iloc[-1])
-
-            c_prev = float(df5["close"].iloc[-2])
-            o_prev = float(df5["open"].iloc[-2])
-            h_prev = float(df5["high"].iloc[-2])
-            l_prev = float(df5["low"].iloc[-2])
-
-            atr_now = float(df5["atr"].iloc[-1] or 0.0)
-            if atr_now <= 0:
-                atr_now = 0.0
-
-            st_now = float(df5["st"].iloc[-1] or 0.0)
-            st_prev = float(df5["st"].iloc[-2] or 0.0)
-            dir_now = float(df5["st_dir"].iloc[-1] or 0.0)
-            dir_prev = float(df5["st_dir"].iloc[-2] or 0.0)
-
-            # 터치 허용오차(ATR 기반)
-            tol_k = float(getattr(Config, "ATR_TOUCH_K", 0.0) or 0.0)
-            tol = (atr_now * tol_k) if (atr_now > 0 and tol_k > 0) else 0.0
-
-            details = {
-                "side": side,
-                "c_now": c_now,
-                "st_now": st_now,
-                "st_prev": st_prev,
-                "dir_now": dir_now,
-                "dir_prev": dir_prev,
-                "atr_now": atr_now,
-                "tol": tol,
-            }
-
-            # 공통 msg는 상위에서 넣되, 여기선 비워둠
+            full_exit = False
             common_msg = ""
 
-            # full_exit 시그널은 포지션 보유 시 exit_loop에서 처리 (여기선 False 고정)
-            full_exit = False
-
-            # 15m BB 확장 게이트(둘 다 동일)
-            # - 이미 공통에서 강제할 수 있으나, 엔트리에서도 한 번 더 게이트(옵션)
-            if getattr(Config, "REQUIRE_ENTRY_BB_EXPAND", False):
-                ok15, _ = TechnicalAnalyzer._bb_shell_expand_1bar(df15)
-                if not ok15:
-                    return False, full_exit, 0.0, "", "", "", details
-
-            bull_prev = (c_prev > o_prev)
-            bull_now = (c_now > o_now)
-            bear_prev = (c_prev < o_prev)
-            bear_now = (c_now < o_now)
-
-            # -------------------------
-            # LONG: 5m ST(10,2) 터치 + ST 상승 + 2연속 양봉
-            # -------------------------
             if side == "long":
-                touch_prev = (l_prev <= (st_prev + tol)) and (c_prev >= st_prev)
-                st_rise = (st_now >= st_prev) and (dir_prev > 0) and (dir_now > 0)
+                # 5m 값
+                bb5_upper_now  = float(df5["bb_upper"].iloc[-1])
+                bb5_upper_prev = float(df5["bb_upper"].iloc[-2])
+                bb5_lower_now  = float(df5["bb_lower"].iloc[-1])
+                bb5_lower_prev = float(df5["bb_lower"].iloc[-2])
+                rsi5_now       = float(df5["rsi"].iloc[-1] or 0.0)
 
-                if touch_prev and st_rise and bull_prev and bull_now:
-                    # SL: max(min(low_now, low_prev), st_now) (롱은 아래)
-                    sl_raw = max(min(l_now, l_prev), st_now)
-                    details["touch_prev"] = touch_prev
-                    details["st_rise"] = st_rise
-                    details["bull_prev"] = bull_prev
-                    details["bull_now"] = bull_now
-                    details["sl_raw"] = sl_raw
+                cond_bb5_expand = (bb5_upper_now > bb5_upper_prev) and (bb5_lower_now < bb5_lower_prev)
+                cond_rsi5       = (rsi5_now > 70.0)
 
-                    return True, full_exit, float(sl_raw), "Buy_5M_ST10_2_Touch", "ST_5m", common_msg, details
+                # 1m 값
+                st1_now   = float(df1["st"].iloc[-1]   or 0.0)
+                st1_prev  = float(df1["st"].iloc[-2]   or 0.0)
+                dir1_now  = int(df1["st_dir"].iloc[-1] or 0)
+                dir1_prev = int(df1["st_dir"].iloc[-2] or 0)
+                atr1_now  = float(df1["atr"].iloc[-1]  or 0.0)
+
+                o1_now  = float(df1["open"].iloc[-1])
+                c1_now  = float(df1["close"].iloc[-1])
+                l1_now  = float(df1["low"].iloc[-1])
+                o1_prev = float(df1["open"].iloc[-2])
+                c1_prev = float(df1["close"].iloc[-2])
+                l1_prev = float(df1["low"].iloc[-2])
+
+                touch_buf = atr1_now * 0.3
+                cond_st1_dir   = (dir1_now == 1) and (dir1_prev == 1)
+                cond_touch     = (l1_prev <= st1_prev + touch_buf)
+                cond_bull_prev = (c1_prev > o1_prev)
+                cond_bull_now  = (c1_now  > o1_now)
+
+                details = {
+                    "side": side,
+                    "cond_bb5_expand": cond_bb5_expand,
+                    "cond_rsi5": cond_rsi5, "rsi5": rsi5_now,
+                    "cond_st1_dir": cond_st1_dir,
+                    "dir1_now": dir1_now, "dir1_prev": dir1_prev,
+                    "cond_touch": cond_touch,
+                    "l1_prev": l1_prev, "st1_prev": st1_prev, "touch_buf": touch_buf,
+                    "cond_bull_prev": cond_bull_prev,
+                    "cond_bull_now": cond_bull_now,
+                    "st1_now": st1_now, "atr1_now": atr1_now,
+                }
+
+                if cond_bb5_expand and cond_rsi5 and cond_st1_dir and cond_touch and cond_bull_prev and cond_bull_now:
+                    sl_raw = max(min(l1_now, l1_prev), st1_now)
+                    return True, full_exit, float(sl_raw), "Buy_1M_ST14_3_Touch", "ST_1m", common_msg, details
 
                 return False, full_exit, 0.0, "", "", "", details
 
-            # -------------------------
-            # SHORT: 5m ST(10,2) 리테스트(위쪽 터치) + ST 하락 + 2연속 음봉
-            # -------------------------
-            if side == "short":
-                # 숏: 슈퍼트렌드가 하방(-1)이고, 이전봉 고가가 ST 근처까지 닿았다가(리테스트) 종가가 ST 아래
-                touch_prev = (h_prev >= (st_prev - tol)) and (c_prev <= st_prev)
-                st_fall = (st_now <= st_prev) and (dir_prev < 0) and (dir_now < 0)
-
-                if touch_prev and st_fall and bear_prev and bear_now:
-                    # SL: min(max(high_now, high_prev), st_now) (숏은 위)
-                    sl_raw = min(max(h_now, h_prev), st_now)
-                    # SL이 현재가 위에 있어야 함
-                    if sl_raw <= c_now:
-                        sl_raw = max(h_now, h_prev, st_now)
-
-                    details["touch_prev"] = touch_prev
-                    details["st_fall"] = st_fall
-                    details["bear_prev"] = bear_prev
-                    details["bear_now"] = bear_now
-                    details["sl_raw"] = sl_raw
-
-                    return True, full_exit, float(sl_raw), "Sell_5M_ST10_2_Retest", "ST_5m", common_msg, details
-
-                return False, full_exit, 0.0, "", "", "", details
-
-            return False, full_exit, 0.0, "", "", "", details
+            return False, full_exit, 0.0, "", "", "", {}
 
         except Exception:
             return False, False, 0.0, "", "", "", {}
@@ -2571,6 +2818,10 @@ class AsyncTradingBot:
             write_log(ERROR_LOG_FILE, "Bybit Testnet(Sandbox) 모드 활성화됨")
 
         self.data_manager = DataManager(self.exchange, self.telegram, self)
+        self.stream_manager = OhlcvStreamManager(
+            self.data_manager, is_testnet=bool(Config.IS_TEST_MODE)
+        )
+        self.common_filter_cache = CommonFilterCache(self.data_manager)
 
         try:
             await self._api_call(self.exchange.load_time_difference, tag="load_time_difference")
@@ -3153,35 +3404,35 @@ class AsyncTradingBot:
                         sem=sem,
                     )
 
-            # -------- 5m SuperTrend 기반 SL 추적 --------
+            # -------- ST 기반 SL 추적 (전략별 분기) --------
+            # Buy_1M_ST14_3_Touch: 1m ST 기반 (ATR 버퍼 0.2)
+            # 기타: 5m ST 기반
             desired_sl = None
+            strategy_note = str(self.entry_strategy_map.get(key, "") or "")
+            use_1m_sl = ("1M_ST" in strategy_note or "Buy_1M" in strategy_note)
             try:
-                dfs = await self.data_manager.fetch_timeframe_data(symbol, "5m", limit=180)
-                if dfs is not None and len(dfs) >= 30:
-                    # 필요 칼럼 정규화
-                    df = dfs.copy()
-                    # add_indicators가 이미 될 수도 있으나, 최소한 atr/st를 확보
-                    try:
-                        df_pack = {"5m": df}
-                        df_pack = TechnicalAnalyzer.add_indicators(df_pack)
-                        df = df_pack["5m"]
-                    except Exception:
-                        pass
-
-                    if "atr" in df.columns and "st" in df.columns and "st_dir" in df.columns:
-                        atr = float(df["atr"].iloc[-1] or 0.0)
-                        st = float(df["st"].iloc[-1] or 0.0)
-                        st_dir = float(df["st_dir"].iloc[-1] or 0.0)
-                        high_now = float(df["high"].iloc[-1] if "high" in df.columns else df["h"].iloc[-1])
-                        low_now = float(df["low"].iloc[-1] if "low" in df.columns else df["l"].iloc[-1])
-
-                        k = float(getattr(Config, "ATR_SL_5M_K", 0.20) or 0.20)
-
-                        if is_long:
-                            if st > 0 and st_dir > 0 and low_now >= st:
-                                desired_sl = st - (atr * k) if (atr > 0 and k > 0) else st
-                                # 유리하게만: SL 올리기
-                                if desired_sl and desired_sl > 0:
+                if use_1m_sl and is_long:
+                    # 1m ST 기반 SL 추적 — stream_manager 우선, REST fallback
+                    df1_sl = None
+                    if hasattr(self, "stream_manager") and self.stream_manager is not None:
+                        df1_sl = await self.stream_manager.get_df(symbol, "1m")
+                    if df1_sl is None or len(df1_sl) < 20:
+                        df1_sl = await self.data_manager.fetch_timeframe_data(symbol, "1m", limit=100)
+                    if df1_sl is not None and len(df1_sl) >= 20:
+                        try:
+                            df_pack1 = {"1m": df1_sl.copy()}
+                            df_pack1 = TechnicalAnalyzer.add_indicators(df_pack1)
+                            df1_sl = df_pack1["1m"]
+                        except Exception:
+                            pass
+                        if "st" in df1_sl.columns and "st_dir" in df1_sl.columns and "atr" in df1_sl.columns:
+                            st1  = float(df1_sl["st"].iloc[-1]    or 0.0)
+                            dir1 = int(df1_sl["st_dir"].iloc[-1]  or 0)
+                            atr1 = float(df1_sl["atr"].iloc[-1]   or 0.0)
+                            atr1_k = 0.20
+                            if st1 > 0 and dir1 == 1:
+                                desired_sl = (st1 - atr1 * atr1_k) if atr1 > 0 else st1
+                                if desired_sl > 0:
                                     if curr_sl <= 0 or (desired_sl > curr_sl and desired_sl < curr_p):
                                         curr_sl = float(desired_sl)
                                         await self.apply_exchange_v5_trading_stop(
@@ -3191,20 +3442,50 @@ class AsyncTradingBot:
                                             pos_idx=int(pos_idx),
                                             sem=sem,
                                         )
-                        else:
-                            if st > 0 and st_dir < 0 and high_now <= st:
-                                desired_sl = st + (atr * k) if (atr > 0 and k > 0) else st
-                                # 유리하게만: SL 내리기(숏은 SL이 내려갈수록 유리)
-                                if desired_sl and desired_sl > 0:
-                                    if curr_sl <= 0 or (desired_sl < curr_sl and desired_sl > curr_p):
-                                        curr_sl = float(desired_sl)
-                                        await self.apply_exchange_v5_trading_stop(
-                                            symbol,
-                                            sl_price=float(curr_sl),
-                                            ts_dist=None,
-                                            pos_idx=int(pos_idx),
-                                            sem=sem,
-                                        )
+                else:
+                    # 5m ST 기반 SL 추적
+                    dfs = await self.data_manager.fetch_timeframe_data(symbol, "5m", limit=180)
+                    if dfs is not None and len(dfs) >= 30:
+                        df = dfs.copy()
+                        try:
+                            df_pack = {"5m": df}
+                            df_pack = TechnicalAnalyzer.add_indicators(df_pack)
+                            df = df_pack["5m"]
+                        except Exception:
+                            pass
+                        if "atr" in df.columns and "st" in df.columns and "st_dir" in df.columns:
+                            atr = float(df["atr"].iloc[-1] or 0.0)
+                            st = float(df["st"].iloc[-1] or 0.0)
+                            st_dir = float(df["st_dir"].iloc[-1] or 0.0)
+                            high_now = float(df["high"].iloc[-1] if "high" in df.columns else 0.0)
+                            low_now = float(df["low"].iloc[-1] if "low" in df.columns else 0.0)
+                            k = float(getattr(Config, "ATR_SL_5M_K", 0.20) or 0.20)
+                            if is_long:
+                                if st > 0 and st_dir > 0 and low_now >= st:
+                                    desired_sl = st - (atr * k) if (atr > 0 and k > 0) else st
+                                    if desired_sl and desired_sl > 0:
+                                        if curr_sl <= 0 or (desired_sl > curr_sl and desired_sl < curr_p):
+                                            curr_sl = float(desired_sl)
+                                            await self.apply_exchange_v5_trading_stop(
+                                                symbol,
+                                                sl_price=float(curr_sl),
+                                                ts_dist=None,
+                                                pos_idx=int(pos_idx),
+                                                sem=sem,
+                                            )
+                            else:
+                                if st > 0 and st_dir < 0 and high_now <= st:
+                                    desired_sl = st + (atr * k) if (atr > 0 and k > 0) else st
+                                    if desired_sl and desired_sl > 0:
+                                        if curr_sl <= 0 or (desired_sl < curr_sl and desired_sl > curr_p):
+                                            curr_sl = float(desired_sl)
+                                            await self.apply_exchange_v5_trading_stop(
+                                                symbol,
+                                                sl_price=float(curr_sl),
+                                                ts_dist=None,
+                                                pos_idx=int(pos_idx),
+                                                sem=sem,
+                                            )
             except Exception:
                 pass
 
@@ -3734,9 +4015,24 @@ class AsyncTradingBot:
                 if c0 > 0:
                     return
 
-                # 데이터 fetch + 지표
-                dfs = await self.data_manager.fetch_entry_data(symbol, limit=260)
-                if not dfs:
+                # 데이터 fetch — stream_manager 캐시 우선, REST fallback
+                dfs = {}
+                sm = getattr(self, "stream_manager", None)
+                if sm is not None:
+                    for tf in getattr(Config, "ENTRY_TFS", ["1m", "5m"]):
+                        df_s = await sm.get_df(symbol, tf)
+                        if df_s is not None and len(df_s) >= 30:
+                            dfs[tf] = df_s
+
+                missing = [tf for tf in getattr(Config, "ENTRY_TFS", ["1m", "5m"]) if tf not in dfs]
+                if missing:
+                    rest_dfs = await self.data_manager.fetch_entry_data(symbol, limit=260)
+                    if rest_dfs:
+                        for tf in missing:
+                            if tf in rest_dfs:
+                                dfs[tf] = rest_dfs[tf]
+
+                if not dfs or "1m" not in dfs or "5m" not in dfs:
                     return
                 try:
                     dfs = TechnicalAnalyzer.add_indicators(dfs)
@@ -3747,11 +4043,15 @@ class AsyncTradingBot:
                 if not sig:
                     return
 
+                # 진입가: 1m 현재봉 종가
+                df1_entry = dfs.get("1m")
                 df5 = dfs.get("5m")
-                if df5 is None or len(df5) < 5:
+                if df1_entry is not None and len(df1_entry) >= 2:
+                    entry_price = float(df1_entry["close"].iloc[-1])
+                elif df5 is not None and len(df5) >= 2:
+                    entry_price = float(df5["close"].iloc[-1])
+                else:
                     return
-
-                entry_price = float(df5["close"].iloc[-1])
 
                 # SL sanitize
                 sl_final = float(entry_sl or 0.0)
@@ -3860,69 +4160,46 @@ class AsyncTradingBot:
                 random.shuffle(sym_list)
 
                 # -------------------------
-                # 2) 공통조건 평가 (LONG)
+                # 2) 공통조건 — CommonFilterCache 캐시 우선
+                #    캐시 히트: 즉시 사용 / 캐시 미스: 백그라운드 갱신 후 이번 루프 스킵
                 # -------------------------
-                common_map = {}  # symbol -> (long_ok, short_ok, msg_long, msg_short)
+                common_map = {}
+                cache_miss_syms = []
+                cf_cache = getattr(self, "common_filter_cache", None)
 
-                async def _eval_common_one(sym):
-                    try:
-                        dfs_common = await self.data_manager.fetch_common_data(sym, limit=260)
-                        if not dfs_common:
-                            return sym, (False, False, "", "")
-                        dfs_common = TechnicalAnalyzer.add_indicators(dfs_common)
-                        l_ok, s_ok, l_msg, s_msg = await TechnicalAnalyzer.check_common_conditions_sides(dfs_common)
-                        return sym, (l_ok, s_ok, l_msg, s_msg)
-                    except Exception:
-                        return sym, (False, False, "", "")
-
-                batch = []
-                for s in sym_list:
-                    batch.append(s)
-                    if len(batch) >= int(getattr(Config, "MAIN_BATCH_SIZE", 10) or 10):
-                        tasks = [_eval_common_one(x) for x in batch]
-                        results = await asyncio.gather(*tasks, return_exceptions=True)
-                        for r in results:
-                            if isinstance(r, Exception):
-                                continue
-                            sym, tup = r
-                            common_map[sym] = tup
-                        batch = []
-
-                if batch:
-                    tasks = [_eval_common_one(x) for x in batch]
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for r in results:
-                        if isinstance(r, Exception):
+                for sym in sym_list:
+                    if cf_cache is not None:
+                        cached = cf_cache.get(sym)
+                        if cached is not None:
+                            common_map[sym] = cached
                             continue
-                        sym, tup = r
-                        common_map[sym] = tup
+                    cache_miss_syms.append(sym)
+
+                # 캐시 미스 심볼은 백그라운드 갱신 (이번 루프 블로킹 없음)
+                if cache_miss_syms and cf_cache is not None:
+                    asyncio.create_task(cf_cache.update_all(cache_miss_syms))
 
                 # -------------------------
                 # 3) 공통조건 통과 심볼 엔트리 검사 (LONG 전용)
                 # -------------------------
                 side = "long"
 
-                eligible = []
-                for sym, (l_ok, s_ok, l_msg, s_msg) in common_map.items():
-                    if l_ok:
-                        eligible.append((sym, l_msg))
+                eligible = [
+                    (sym, l_msg)
+                    for sym, (l_ok, s_ok, l_msg, s_msg) in common_map.items()
+                    if l_ok
+                ]
 
                 if not eligible:
                     await asyncio.sleep(Config.MAIN_LOOP_SEC)
                     continue
 
-                # 엔트리 체크는 배치로
-                ent_batch = []
-                for sym, msg in eligible:
-                    ent_batch.append((sym, msg))
-                    if len(ent_batch) >= int(getattr(Config, "MAIN_BATCH_SIZE", 10) or 10):
-                        tasks = [self.process_symbol(x, total_bal, side=side, common_msg=m) for x, m in ent_batch]
-                        await asyncio.gather(*tasks, return_exceptions=True)
-                        ent_batch = []
-
-                if ent_batch:
-                    tasks = [self.process_symbol(x, total_bal, side=side, common_msg=m) for x, m in ent_batch]
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                # 엔트리 시그널 체크 (배치, 딜레이 없음)
+                tasks = [
+                    self.process_symbol(sym, total_bal, side=side, common_msg=msg)
+                    for sym, msg in eligible
+                ]
+                await asyncio.gather(*tasks, return_exceptions=True)
 
                 await asyncio.sleep(Config.MAIN_LOOP_SEC)
 
@@ -3953,6 +4230,30 @@ async def _main_async():
     # 알림 워커 먼저(BOOT/START 메시지 누락 방지)
     notif_task = asyncio.create_task(bot.notification_worker(), name="notification_worker")
 
+    # WebSocket 스트림 시작
+    if bot.stream_manager is not None:
+        await bot.stream_manager.start()
+    stream_task = bot.stream_manager._ws_task if (bot.stream_manager and bot.stream_manager._ws_task) else None
+
+    # 공통필터 캐시 갱신 태스크
+    async def _common_filter_updater():
+        update_sec = float(getattr(Config, "COMMON_FILTER_UPDATE_SEC", 5.0))
+        while bot.is_running:
+            try:
+                cf = bot.common_filter_cache
+                if cf is not None:
+                    async with bot.candidate_lock:
+                        syms = list(bot.candidate_symbols or [])
+                    if syms:
+                        await cf.update_all(syms)
+                        if bot.stream_manager is not None:
+                            await bot.stream_manager.update_subscriptions(syms)
+            except Exception as e:
+                write_log(ERROR_LOG_FILE, f"[CF_UPDATER] 예외: {e}")
+            await asyncio.sleep(update_sec)
+
+    cf_task = asyncio.create_task(_common_filter_updater(), name="common_filter_updater")
+
     # 백그라운드 루프들
     cand_task = asyncio.create_task(bot.candidate_refresher_loop(), name="candidate_refresher")
     uni_task = asyncio.create_task(bot.universe_refresher_loop(), name="universe_refresher")
@@ -3965,7 +4266,7 @@ async def _main_async():
     try:
         start_msg = (
             f"[BOT START] mode={'TESTNET' if Config.IS_TEST_MODE else 'REAL'} | "
-            f"short={'ON' if getattr(Config, 'ENABLE_SHORT', True) else 'OFF'} | "
+            f"strategy=Buy_1M_ST14_3_Touch | stream=ON | loop={Config.MAIN_LOOP_SEC}s | "
             f"universe={len(getattr(bot, 'universe_symbols', []) or [])} "
             f"candidates={len(getattr(bot, 'candidate_symbols', []) or [])}"
         )
@@ -3979,14 +4280,23 @@ async def _main_async():
         await asyncio.gather(main_task, exit_task)
     finally:
         bot.is_running = False
-        tasks = [main_task, exit_task, cand_task, uni_task, rep_task, notif_task]
-        for task in tasks:
+        bg_tasks = [main_task, exit_task, cand_task, uni_task, rep_task, notif_task, cf_task]
+        if stream_task:
+            bg_tasks.append(stream_task)
+        for task in bg_tasks:
             try:
                 if not task.done():
                     task.cancel()
             except Exception:
                 pass
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*bg_tasks, return_exceptions=True)
+
+        # WebSocket 스트림 정리
+        try:
+            if bot.stream_manager:
+                await bot.stream_manager.stop()
+        except Exception:
+            pass
 
         # 리소스 정리
         try:
