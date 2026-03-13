@@ -3693,7 +3693,7 @@ class AsyncTradingBot:
                 pass
 
             self.queue_notify(
-                f"[ORDER_ATTEMPT] {side.upper()} {symbol}\n전략: {note}\n가격: {target_p}\n수량: {qty_prec}\nSL:{sl_sanitized if sl_sanitized else 'post-set'}"
+                f"[ORDER_ATTEMPT] {side.upper()} {symbol}\n전략: {note}\n가격: {target_p}\n수량: {qty_prec}\nSL:{sl_sanitized if sl_sanitized else 'post-set'}\n잔고: {total_bal:.2f} USDT"
             )
 
             # -----------------------
