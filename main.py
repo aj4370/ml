@@ -1218,32 +1218,22 @@ class TechnicalAnalyzer:
             m30_h = float(df30["macd_hist"].iloc[-1])
             m1_h = float(df1["macd_hist"].iloc[-1])
 
-            # 볼린저/조개(4h)
-            bb4_upper = df4.get("bb_upper")
-            bb4_lower = df4.get("bb_lower")
-            bb4_width = None
-            if bb4_upper is not None and bb4_lower is not None:
-                try:
-                    bb4_width = float((bb4_upper - bb4_lower).iloc[-1])
-                except Exception:
-                    bb4_width = None
+            # RSI 강세 조건: 30분 or 1시간 RSI >= 70
+            cond_rsi_strong = (r30 >= 70) or (r1 >= 70)
 
-            bb4_shell = False
+            # 15m BB 조개(확장) 조건: 상단↑ AND 하단↓
+            cond_bb = False
             try:
-                # "조개" 조건: 최근 N봉에서 폭이 축소(정체) 후 한봉 확장 직전/직후 느낌
-                # (기존 로직과 최대한 유사하게 유지)
-                if bb4_width is not None:
-                    w = df4["bb_width"].astype(float) if "bb_width" in df4.columns else None
-                    if w is not None and len(w) >= 25:
-                        w_now = float(w.iloc[-1])
-                        w_min = float(w.iloc[-20:].min())
-                        bb4_shell = (w_now <= (w_min * 1.25))
+                bb15_upper = df15.get("bb_upper")
+                bb15_lower = df15.get("bb_lower")
+                if bb15_upper is not None and bb15_lower is not None and len(bb15_upper) >= 2:
+                    bb15_upper_now = float(bb15_upper.iloc[-1])
+                    bb15_upper_prev = float(bb15_upper.iloc[-2])
+                    bb15_lower_now = float(bb15_lower.iloc[-1])
+                    bb15_lower_prev = float(bb15_lower.iloc[-2])
+                    cond_bb = (bb15_upper_now > bb15_upper_prev) and (bb15_lower_now < bb15_lower_prev)
             except Exception:
-                bb4_shell = False
-
-            # RSI 기반 강세: 기존 조건 유지
-            cond_r4_strong = (bb4_shell and r4 >= 70) or (bb4_shell and r30 >= 70 and r1 >= 70 and r4 >= 60)
-            cond_rsi_strong = cond_r4_strong and (r1 >= 60) and (r30 >= 60) and (r15 >= 55)
+                cond_bb = False
 
             # MACD 히스토그램 양수(모멘텀)
             cond_macd = (m30_h > 0.0) or (m1_h > 0.0)
@@ -1288,11 +1278,12 @@ class TechnicalAnalyzer:
                 if not cond_bb_expand:
                     return False, ""
 
-            ok = cond_rsi_strong and cond_macd and cond_vol and cond_adx
+            ok = cond_rsi_strong and cond_bb and cond_macd and cond_vol and cond_adx
 
             if ok:
                 msg = (
-                    f"[COMMON_LONG] RSI 4h/1h/30m/15m={r4:.2f}/{r1:.2f}/{r30:.2f}/{r15:.2f} | "
+                    f"[COMMON_LONG] RSI 1h/30m={r1:.2f}/{r30:.2f} | "
+                    f"BB15_expand={'OK' if cond_bb else 'x'} | "
                     f"MACD_hist(30m/1h)={m30_h:.4f}/{m1_h:.4f} | "
                     f"VOL15>{'MA20' if cond_vol else 'x'} | "
                     f"ADX15={'OK' if cond_adx else 'x'}"
@@ -1330,14 +1321,17 @@ class TechnicalAnalyzer:
             m30_h = float(df30["macd_hist"].iloc[-1])
             m1_h = float(df1["macd_hist"].iloc[-1])
 
-            # 4h BB 조개(수축)
+            # 4h BB 조개(확장): 상단↑ AND 하단↓
             bb4_shell = False
             try:
-                w = df4["bb_width"].astype(float) if "bb_width" in df4.columns else None
-                if w is not None and len(w) >= 25:
-                    w_now = float(w.iloc[-1])
-                    w_min = float(w.iloc[-20:].min())
-                    bb4_shell = (w_now <= (w_min * 1.25))
+                bb4_upper = df4.get("bb_upper")
+                bb4_lower = df4.get("bb_lower")
+                if bb4_upper is not None and bb4_lower is not None and len(bb4_upper) >= 2:
+                    bb4_upper_now = float(bb4_upper.iloc[-1])
+                    bb4_upper_prev = float(bb4_upper.iloc[-2])
+                    bb4_lower_now = float(bb4_lower.iloc[-1])
+                    bb4_lower_prev = float(bb4_lower.iloc[-2])
+                    bb4_shell = (bb4_upper_now > bb4_upper_prev) and (bb4_lower_now < bb4_lower_prev)
             except Exception:
                 bb4_shell = False
 
