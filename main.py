@@ -229,7 +229,7 @@ class Config:
 
     TOP_COIN_LIMIT = 300       # 전체 감시 Universe (활성도 점수로 확정된 200)
     CANDIDATE_LIMIT = 100      # Universe(200)에서 다시 후보군 100
-    CANDIDATE_REFRESH_SEC = 300  # 후보군 갱신 주기(초) - 너무 잦은 변경 방지
+    CANDIDATE_REFRESH_SEC = 30  # 후보군 갱신 주기(초)
 
     # [Universe Refresh] 유니버스 자체를 주기적으로 재선정
     UNIVERSE_REFRESH_SEC = 300   # 5분마다 유니버스 재선정(추천: 300~900)
@@ -814,8 +814,10 @@ class CommonFilterCache:
                 return
             dfs = TechnicalAnalyzer.add_indicators(dfs)
             l_ok, s_ok, l_msg, s_msg = await TechnicalAnalyzer.check_common_conditions_sides(dfs)
+            # 지터(jitter): 심볼마다 만료 시점을 분산 → thundering herd 방지
+            jitter = random.uniform(0, self._ttl * 0.3)
             async with self._lock:
-                self._cache[symbol] = (bool(l_ok), bool(s_ok), str(l_msg), str(s_msg), time.time())
+                self._cache[symbol] = (bool(l_ok), bool(s_ok), str(l_msg), str(s_msg), time.time() - jitter)
         except Exception as e:
             write_log(ERROR_LOG_FILE, f"[CF_CACHE] {symbol} 갱신 실패: {e}")
 
@@ -827,11 +829,21 @@ class CommonFilterCache:
             for k in obsolete:
                 del self._cache[k]
 
+    def get_any(self, symbol: str):
+        """TTL 무관하게 마지막 캐시 결과 반환 (없으면 None). TTL 만료 중 run_loop fallback용."""
+        entry = self._cache.get(symbol)
+        if entry is None:
+            return None
+        long_ok, short_ok, msg_l, msg_s, ts = entry
+        return long_ok, short_ok, msg_l, msg_s
+
     async def update_all(self, symbols: list):
         now = time.time()
-        stale = [s for s in symbols if (
-            self._cache.get(s) is None or (now - self._cache[s][4]) > self._ttl
-        )]
+        # _lock 보호 하에 stale 목록 산출 (race condition 방지)
+        async with self._lock:
+            stale = [s for s in symbols if (
+                self._cache.get(s) is None or (now - self._cache[s][4]) > self._ttl
+            )]
         if not stale:
             return
         batch_size = int(getattr(Config, "MAIN_BATCH_SIZE", 10))
@@ -4290,6 +4302,13 @@ class AsyncTradingBot:
                         if cached is not None:
                             common_map[sym] = cached
                             continue
+                        # TTL 만료 시: 마지막 알려진 결과 fallback (완전 없을 때만 miss)
+                        # → thundering herd 재조회 중에도 심볼이 사라지지 않음
+                        stale = cf_cache.get_any(sym)
+                        if stale is not None:
+                            common_map[sym] = stale
+                            cache_miss_syms.append(sym)  # 백그라운드 갱신은 계속 요청
+                            continue
                     cache_miss_syms.append(sym)
 
                 # 캐시 미스 심볼은 백그라운드 갱신 (이번 루프 블로킹 없음)
@@ -4366,7 +4385,8 @@ async def _main_async():
                     async with bot.candidate_lock:
                         syms = list(bot.candidate_symbols or [])
                     if syms:
-                        await cf.prune(syms)   # 전체 목록 기준으로 불필요 항목 삭제
+                        # prune 제거: 능동적 캐시 삭제가 thundering herd 유발
+                        # 오래된 항목은 TTL 만료로 자연 소멸 (get()에서 None 반환)
                         await cf.update_all(syms)
                         if bot.stream_manager is not None:
                             await bot.stream_manager.update_subscriptions(syms)
