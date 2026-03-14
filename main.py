@@ -133,7 +133,7 @@ class Config:
     RISK_PER_TRADE_PERCENT = 0.009  ##백분으로 변환 기재
 
     # [시스템 보호] 총 자산 대비 실시간 손실 한도 도달 시 즉시 전량 청산
-    HARD_STOP_LOSS_PERCENT = -0.009 ##0.9% 그대로 기재
+    HARD_STOP_LOSS_PERCENT = -0.9  # -0.9% (pnl/bal*100 비교 기준, 퍼센트 단위)
 
 
     LEVERAGE_SAFETY_BUFFER = 1.00
@@ -1572,7 +1572,7 @@ class TechnicalAnalyzer:
 # -----------------------------------------------------------
 # [모듈 5] 리스크 매니저 - 자산 비중 및 레버리지 계산
 # -----------------------------------------------------------
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 
 # -----------------------------------------------------------
 # [모듈 5] 리스크 매니저 - 자산 비중 및 레버리지 계산 (교체)
@@ -1593,8 +1593,9 @@ class RiskManager:
         dv = Decimal(str(v))
         ds = Decimal(str(s))
 
-        # 가장 가까운 스텝으로 스냅 (ROUND_HALF_UP)
-        n = (dv / ds).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        # 레버리지는 초과하면 안 되므로 내림(ROUND_DOWN)
+        # ROUND_HALF_UP은 calc_lev=3.25, step=0.5면 3.5로 올려서 목표 리스크 초과
+        n = (dv / ds).quantize(Decimal("1"), rounding=ROUND_DOWN)
         out = n * ds
         return float(out)
 
@@ -3978,6 +3979,13 @@ class AsyncTradingBot:
                     await asyncio.sleep(Config.EXIT_LOOP_SEC)
                     continue
 
+                # TP/HardStop에 필요한 잔고 조회 (포지션 루프 전 1회)
+                try:
+                    bal_info = await self._api_call(self.exchange.fetch_balance, tag="exit_bal", sem=self.api_sem)
+                    total_bal = float((bal_info.get("total") or {}).get("USDT") or 0.0)
+                except Exception:
+                    total_bal = 0.0
+
                 for pos in positions:
                     try:
                         symbol = pos.get("symbol")
@@ -4008,7 +4016,7 @@ class AsyncTradingBot:
                             df1_ex = None
                             sm = getattr(self, "stream_manager", None)
                             if sm is not None:
-                                df1_ex = await sm.get_df(symbol, "1m")
+                                df1_ex = await sm.get_df(symbol, "1m", exclude_last=True)
                             if df1_ex is None or len(df1_ex) < 5:
                                 df1_ex = await self.data_manager.fetch_timeframe_data(symbol, "1m", limit=60)
                             if df1_ex is not None and len(df1_ex) >= 5:
@@ -4063,11 +4071,11 @@ class AsyncTradingBot:
                         except Exception:
                             df5i = df5
 
-                        # 캔들 + EMA20
+                        # 캔들 + EMA20 — 확정봉[-2] 기준 ([-1]은 미확정봉)
                         try:
-                            o_now = float(df5i["open"].iloc[-1])
-                            c_now = float(df5i["close"].iloc[-1])
-                            e_now = float(df5i["ema20"].iloc[-1]) if "ema20" in df5i.columns else None
+                            o_now = float(df5i["open"].iloc[-2])
+                            c_now = float(df5i["close"].iloc[-2])
+                            e_now = float(df5i["ema20"].iloc[-2]) if "ema20" in df5i.columns else None
                         except Exception:
                             o_now, c_now, e_now = 0.0, 0.0, None
 
@@ -4103,10 +4111,20 @@ class AsyncTradingBot:
                             )
                             continue
 
+                        # 하드스탑: 손실 한도 초과 즉시 전량 청산
+                        if total_bal > 0:
+                            hard_stopped = await self.manage_hard_stop(symbol, pos, total_bal)
+                            if hard_stopped:
+                                continue
+
+                        # 부분 익절 (TP1: 3%, TP2: 5%)
+                        if total_bal > 0:
+                            await self.manage_profit_taking(symbol, pos, curr_p, total_bal)
+
                         # (옵션) ST flip top-up: LONG에서만
                         try:
                             if is_long:
-                                await self.maybe_stflip_topup(symbol, pos, curr_p)
+                                await self.maybe_stflip_topup(symbol, pos, total_bal, curr_p)
                         except Exception:
                             pass
 
@@ -4216,17 +4234,8 @@ class AsyncTradingBot:
                 if not qty or float(qty) <= 0:
                     return
 
-                # 레버리지 세팅
-                try:
-                    await self._api_call(
-                        self.exchange.set_leverage,
-                        float(lev),
-                        symbol,
-                        params={"category": "linear"},
-                        tag=f"set_leverage:{symbol}",
-                    )
-                except Exception:
-                    pass
+                # 레버리지는 execute_aggressive_order에서 오더북 기반 실제 진입가로
+                # 재산정 후 set_leverage 호출하므로 여기서 중복 호출하지 않음
 
                 note = f"{'LONG' if side=='long' else 'SHORT'}|{st_name}"
                 if common_msg:
