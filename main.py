@@ -229,7 +229,7 @@ class Config:
 
     TOP_COIN_LIMIT = 300       # 전체 감시 Universe (활성도 점수로 확정된 200)
     CANDIDATE_LIMIT = 100      # Universe(200)에서 다시 후보군 100
-    CANDIDATE_REFRESH_SEC = 30  # 후보군 갱신 주기(초)
+    CANDIDATE_REFRESH_SEC = 300  # 후보군 갱신 주기(초) - 너무 잦은 변경 방지
 
     # [Universe Refresh] 유니버스 자체를 주기적으로 재선정
     UNIVERSE_REFRESH_SEC = 300   # 5분마다 유니버스 재선정(추천: 300~900)
@@ -605,13 +605,19 @@ class OhlcvStreamManager:
                     if key not in self._subscribed:
                         self._pending_subs.add(key)
 
-    async def get_df(self, symbol: str, tf: str):
+    async def get_df(self, symbol: str, tf: str, exclude_last: bool = False):
+        """
+        exclude_last=True: 진행 중인(미확정) 마지막 캔들 제외
+        → 지표 계산 시 확정된 캔들만 사용해 RSI/MACD 안정화
+        """
         key = (str(symbol), str(tf))
         async with self._cache_lock:
             dq = self._cache.get(key)
             if not dq or len(dq) < 10:
                 return None
             rows = list(dq)
+        if exclude_last and len(rows) > 1:
+            rows = rows[:-1]
         df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -3100,6 +3106,7 @@ class AsyncTradingBot:
         """
         [PATCH]
         - 유니버스를 주기적으로 재선정
+        - CCXT markets stale 방지: 매 사이클 load_markets(reload=True)
         """
         await asyncio.sleep(3)
 
@@ -3108,6 +3115,16 @@ class AsyncTradingBot:
 
         while self.is_running:
             try:
+                # CCXT market data 갱신 (lot size, min qty 등 stale 방지)
+                try:
+                    await self._api_call(
+                        self.exchange.load_markets,
+                        True,  # reload=True
+                        tag="reload_markets",
+                    )
+                except Exception as _me:
+                    write_log(ERROR_LOG_FILE, f"[MARKETS_RELOAD_ERR] {_me}")
+
                 await self.refresh_universe_once()
             except Exception as e:
                 write_log(ERROR_LOG_FILE, f"[UNIVERSE_LOOP_ERR] {e}", include_traceback=True)
@@ -3156,8 +3173,15 @@ class AsyncTradingBot:
 
                 # 캐시 상태 집계
                 cf = getattr(self, "common_filter_cache", None)
-                cache_total = len(cf._cache) if cf else 0
-                cache_pass = sum(1 for v in cf._cache.values() if v[0]) if cf else 0
+                if cf is not None:
+                    async with cf._lock:
+                        cache_snapshot = dict(cf._cache)
+                    cache_total = len(cache_snapshot)
+                    cache_pass = sum(1 for v in cache_snapshot.values() if v[0])
+                else:
+                    cache_snapshot = {}
+                    cache_total = 0
+                    cache_pass = 0
 
                 async with self.candidate_lock:
                     cand_n = len(self.candidate_symbols or [])
@@ -3175,8 +3199,8 @@ class AsyncTradingBot:
                 else:
                     msg += "현재 공통조건 만족 종목 없음\n"
                     # 실패 이유 샘플 (최대 5개)
-                    if cf and cf._cache:
-                        fail_samples = [(s, v[2]) for s, v in list(cf._cache.items())[:5] if not v[0] and v[2]]
+                    if cf and cache_snapshot:
+                        fail_samples = [(s, v[2]) for s, v in list(cache_snapshot.items())[:5] if not v[0] and v[2]]
                         if fail_samples:
                             msg += "실패사유 샘플:\n"
                             for s, reason in fail_samples:
@@ -3460,7 +3484,7 @@ class AsyncTradingBot:
                     # 1m ST 기반 SL 추적 — stream_manager 우선, REST fallback
                     df1_sl = None
                     if hasattr(self, "stream_manager") and self.stream_manager is not None:
-                        df1_sl = await self.stream_manager.get_df(symbol, "1m")
+                        df1_sl = await self.stream_manager.get_df(symbol, "1m", exclude_last=True)
                     if df1_sl is None or len(df1_sl) < 20:
                         df1_sl = await self.data_manager.fetch_timeframe_data(symbol, "1m", limit=100)
                     if df1_sl is not None and len(df1_sl) >= 20:
@@ -3689,8 +3713,8 @@ class AsyncTradingBot:
                                 f"(lev:{lev2}, P:{target_p}, SL:{sl_sanitized})"
                             )
                             qty_prec = qty2_prec
-            except Exception:
-                pass
+            except Exception as _patch_e:
+                write_log(ERROR_LOG_FILE, f"[PATCH_ERR] {symbol} qty재산정 중 예외: {_patch_e}", include_traceback=True)
 
             self.queue_notify(
                 f"[ORDER_ATTEMPT] {side.upper()} {symbol}\n전략: {note}\n가격: {target_p}\n수량: {qty_prec}\nSL:{sl_sanitized if sl_sanitized else 'post-set'}\n잔고: {total_bal:.2f} USDT"
@@ -4113,7 +4137,7 @@ class AsyncTradingBot:
                 sm = getattr(self, "stream_manager", None)
                 if sm is not None:
                     for tf in getattr(Config, "ENTRY_TFS", ["1m", "5m"]):
-                        df_s = await sm.get_df(symbol, tf)
+                        df_s = await sm.get_df(symbol, tf, exclude_last=True)
                         if df_s is not None and len(df_s) >= 30:
                             dfs[tf] = df_s
 
