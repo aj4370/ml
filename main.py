@@ -3139,6 +3139,18 @@ class AsyncTradingBot:
                     write_log(ERROR_LOG_FILE, f"[MARKETS_RELOAD_ERR] {_me}")
 
                 await self.refresh_universe_once()
+
+                # universe 갱신 후 캐시 정리: universe에 없는 심볼만 제거
+                # (candidates 교체 시가 아닌 universe 교체 시에만 → thundering herd 방지)
+                cf = getattr(self, "common_filter_cache", None)
+                if cf is not None:
+                    uni_set = set(self.universe_symbols or [])
+                    if uni_set:
+                        async with cf._lock:
+                            obsolete = [k for k in list(cf._cache.keys()) if k not in uni_set]
+                            for k in obsolete:
+                                del cf._cache[k]
+
             except Exception as e:
                 write_log(ERROR_LOG_FILE, f"[UNIVERSE_LOOP_ERR] {e}", include_traceback=True)
 
@@ -3184,24 +3196,26 @@ class AsyncTradingBot:
 
                 strong_items = list(self.found_strong_symbols.items())
 
-                # 캐시 상태 집계
+                # 캐시 상태 집계 — candidates 기준으로만 (universe 전체 캐시와 혼동 방지)
                 cf = getattr(self, "common_filter_cache", None)
+                async with self.candidate_lock:
+                    cand_syms = list(self.candidate_symbols or [])
+                cand_n = len(cand_syms)
+
                 if cf is not None:
                     async with cf._lock:
                         cache_snapshot = dict(cf._cache)
-                    cache_total = len(cache_snapshot)
-                    cache_pass = sum(1 for v in cache_snapshot.values() if v[0])
+                    # candidates 기준 필터
+                    cand_cache = {s: cache_snapshot[s] for s in cand_syms if s in cache_snapshot}
+                    cache_loaded = len(cand_cache)           # candidates 중 캐시 적재된 수
+                    cache_pass = sum(1 for v in cand_cache.values() if v[0])  # 현재 long_ok=True
                 else:
-                    cache_snapshot = {}
-                    cache_total = 0
+                    cache_loaded = 0
                     cache_pass = 0
 
-                async with self.candidate_lock:
-                    cand_n = len(self.candidate_symbols or [])
-
                 msg = (
-                    f"[5M 리포트] 공통필터 통과 {len(strong_items)}개\n"
-                    f"캐시: {cache_total}/{cand_n}개 적재 | 통과: {cache_pass}개\n"
+                    f"[5M 리포트] 지난5분 공통필터 통과경험: {len(strong_items)}개\n"
+                    f"후보{cand_n}개 중 캐시적재: {cache_loaded}개 | 현재long_ok: {cache_pass}개\n"
                 )
 
                 if strong_items:
