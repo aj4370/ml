@@ -1234,32 +1234,29 @@ class TechnicalAnalyzer:
 
             if df4 is None or df1 is None or df30 is None or df15 is None:
                 return False, ""
-            # 데이터 충분성 확인 (확정봉[-2] 기준이므로 최소 3봉 필요)
-            if len(df4) < 3 or len(df1) < 3 or len(df30) < 3 or len(df15) < 3:
-                return False, ""
 
-            # 확정봉[-2] 기준 (REST 조회 [-1]은 미확정봉: 15분~4시간마다 변해 지표 불안정)
-            r4  = float(df4["rsi"].iloc[-2])
-            r1  = float(df1["rsi"].iloc[-2])
-            r30 = float(df30["rsi"].iloc[-2])
-            r15 = float(df15["rsi"].iloc[-2])
+            # 마지막 값 추출
+            r4  = float(df4["rsi"].iloc[-1])
+            r1  = float(df1["rsi"].iloc[-1])
+            r30 = float(df30["rsi"].iloc[-1])
+            r15 = float(df15["rsi"].iloc[-1])
 
-            m30_h = float(df30["macd_hist"].iloc[-2])
-            m1_h  = float(df1["macd_hist"].iloc[-2])
+            m30_h = float(df30["macd_hist"].iloc[-1])
+            m1_h  = float(df1["macd_hist"].iloc[-1])
 
             # RSI 강세 조건: 30분 or 1시간 RSI >= 70
             cond_rsi_strong = (r30 >= 70) or (r1 >= 70)
 
-            # 15m BB 조개(확장) 조건: 확정봉[-2] > 이전확정봉[-3]
+            # 15m BB 조개(확장) 조건: 상단↑ AND 하단↓
             cond_bb = False
             try:
                 bb15_upper = df15.get("bb_upper")
                 bb15_lower = df15.get("bb_lower")
-                if bb15_upper is not None and bb15_lower is not None and len(bb15_upper) >= 3:
-                    bb15_upper_now  = float(bb15_upper.iloc[-2])
-                    bb15_upper_prev = float(bb15_upper.iloc[-3])
-                    bb15_lower_now  = float(bb15_lower.iloc[-2])
-                    bb15_lower_prev = float(bb15_lower.iloc[-3])
+                if bb15_upper is not None and bb15_lower is not None and len(bb15_upper) >= 2:
+                    bb15_upper_now  = float(bb15_upper.iloc[-1])
+                    bb15_upper_prev = float(bb15_upper.iloc[-2])
+                    bb15_lower_now  = float(bb15_lower.iloc[-1])
+                    bb15_lower_prev = float(bb15_lower.iloc[-2])
                     cond_bb = (bb15_upper_now > bb15_upper_prev) and (bb15_lower_now < bb15_lower_prev)
             except Exception:
                 cond_bb = False
@@ -1267,20 +1264,20 @@ class TechnicalAnalyzer:
             # MACD 히스토그램 양수(모멘텀)
             cond_macd = (m30_h > 0.0) or (m1_h > 0.0)
 
-            # 15m 거래량: 확정봉[-2] > 20MA
+            # 15m 거래량: 현재봉 > 20MA
             v15 = df15["volume"].astype(float)
             v15_ma20 = v15.rolling(20).mean()
             cond_vol = False
             if len(v15) >= 25:
-                cond_vol = float(v15.iloc[-2]) > float(v15_ma20.iloc[-2])
+                cond_vol = float(v15.iloc[-1]) > float(v15_ma20.iloc[-1])
 
-            # ADX 트렌드 필터(15m) - 확정봉[-2] 기준
+            # ADX 트렌드 필터(15m)
             cond_adx = False
             try:
                 adx = df15.get("adx")
-                if adx is not None and len(adx) >= 4:
-                    adx_now  = float(adx.iloc[-2])
-                    adx_prev = float(adx.iloc[-3])
+                if adx is not None and len(adx) >= 3:
+                    adx_now  = float(adx.iloc[-1])
+                    adx_prev = float(adx.iloc[-2])
                     cond_adx = (adx_now >= float(Config.ADX_STRONG)) or (
                         (adx_now >= float(Config.ADX_MIN_TREND)) and (adx_now >= adx_prev)
                     )
@@ -1353,28 +1350,25 @@ class TechnicalAnalyzer:
 
             if df4 is None or df1 is None or df30 is None or df15 is None:
                 return False, ""
-            if len(df4) < 3 or len(df1) < 3 or len(df30) < 3 or len(df15) < 3:
-                return False, ""
 
-            # 확정봉[-2] 기준
-            r4  = float(df4["rsi"].iloc[-2])
-            r1  = float(df1["rsi"].iloc[-2])
-            r30 = float(df30["rsi"].iloc[-2])
-            r15 = float(df15["rsi"].iloc[-2])
+            r4  = float(df4["rsi"].iloc[-1])
+            r1  = float(df1["rsi"].iloc[-1])
+            r30 = float(df30["rsi"].iloc[-1])
+            r15 = float(df15["rsi"].iloc[-1])
 
-            m30_h = float(df30["macd_hist"].iloc[-2])
-            m1_h  = float(df1["macd_hist"].iloc[-2])
+            m30_h = float(df30["macd_hist"].iloc[-1])
+            m1_h  = float(df1["macd_hist"].iloc[-1])
 
-            # 4h BB 조개(확장): 확정봉[-2] 기준
+            # 4h BB 조개(확장): 상단↑ AND 하단↓
             bb4_shell = False
             try:
                 bb4_upper = df4.get("bb_upper")
                 bb4_lower = df4.get("bb_lower")
-                if bb4_upper is not None and bb4_lower is not None and len(bb4_upper) >= 3:
-                    bb4_upper_now  = float(bb4_upper.iloc[-2])
-                    bb4_upper_prev = float(bb4_upper.iloc[-3])
-                    bb4_lower_now  = float(bb4_lower.iloc[-2])
-                    bb4_lower_prev = float(bb4_lower.iloc[-3])
+                if bb4_upper is not None and bb4_lower is not None and len(bb4_upper) >= 2:
+                    bb4_upper_now  = float(bb4_upper.iloc[-1])
+                    bb4_upper_prev = float(bb4_upper.iloc[-2])
+                    bb4_lower_now  = float(bb4_lower.iloc[-1])
+                    bb4_lower_prev = float(bb4_lower.iloc[-2])
                     bb4_shell = (bb4_upper_now > bb4_upper_prev) and (bb4_lower_now < bb4_lower_prev)
             except Exception:
                 bb4_shell = False
@@ -1386,20 +1380,20 @@ class TechnicalAnalyzer:
             # MACD 히스토그램 음수(모멘텀)
             cond_macd = (m30_h < 0.0) or (m1_h < 0.0)
 
-            # 15m 거래량: 확정봉[-2] > 20MA
+            # 15m 거래량: 현재봉 > 20MA (변동성/체결활성)
             v15 = df15["volume"].astype(float)
             v15_ma20 = v15.rolling(20).mean()
             cond_vol = False
             if len(v15) >= 25:
-                cond_vol = float(v15.iloc[-2]) > float(v15_ma20.iloc[-2])
+                cond_vol = float(v15.iloc[-1]) > float(v15_ma20.iloc[-1])
 
-            # ADX 트렌드 필터(15m): 확정봉[-2] 기준
+            # ADX 트렌드 필터(15m): 방향 무관(강한 추세면 OK)
             cond_adx = False
             try:
                 adx = df15.get("adx")
-                if adx is not None and len(adx) >= 4:
-                    adx_now  = float(adx.iloc[-2])
-                    adx_prev = float(adx.iloc[-3])
+                if adx is not None and len(adx) >= 3:
+                    adx_now  = float(adx.iloc[-1])
+                    adx_prev = float(adx.iloc[-2])
                     cond_adx = (adx_now >= float(Config.ADX_STRONG)) or (
                         (adx_now >= float(Config.ADX_MIN_TREND)) and (adx_now >= adx_prev)
                     )
@@ -3030,16 +3024,10 @@ class AsyncTradingBot:
         qv_n = _minmax_norm(qv_list)
         sc_n = _minmax_norm(sc_list)
 
-        # hysteresis: 기존 candidates에 있는 심볼은 점수에 보너스 → 잦은 교체 방지
-        async with self.candidate_lock:
-            current_set = set(self.candidate_symbols or [])
-
-        HYSTERESIS_BONUS = 0.08  # 기존 후보 유지 보너스 (혼합점수 0~1 기준)
         ranked = []
         for i, s in enumerate(uni):
+            # 혼합: 활성도(캐시) 0.70 + qv(최근) 0.30
             mix = (float(sc_n[i]) * 0.70) + (float(qv_n[i]) * 0.30)
-            if s in current_set:
-                mix += HYSTERESIS_BONUS
             ranked.append((s, mix))
 
         ranked.sort(key=lambda x: x[1], reverse=True)
@@ -3681,16 +3669,41 @@ class AsyncTradingBot:
 
             # qty 정밀도/최소수량 처리
             qty_raw = float(qty)
-            qty_prec = float(self.exchange.amount_to_precision(symbol, qty_raw))
+
+            # --- 근본 수정: market info에서 step_size 직접 추출 후 Decimal floor ---
+            # CCXT amount_to_precision은 markets 정보 오류 시 잘못된 값 반환 가능
+            # (예: NEO step=1 인데 CCXT가 0.1로 알고 있으면 qty=9.1 → Bybit 거부)
+            def _floor_to_step(raw: float, sym: str) -> float:
+                try:
+                    mkt = self.exchange.market(sym)
+                    # CCXT TICK_SIZE 모드: precision.amount = step 값 자체
+                    step_val = (
+                        mkt.get("precision", {}).get("amount")
+                        or mkt.get("limits", {}).get("amount", {}).get("step")
+                    )
+                    if step_val is None:
+                        return float(self.exchange.amount_to_precision(sym, raw))
+                    step_f = float(step_val)
+                    if step_f <= 0:
+                        return float(self.exchange.amount_to_precision(sym, raw))
+                    # Decimal 기반 내림(floor) — ROUND_DOWN 항상 적용
+                    d_raw  = Decimal(str(raw))
+                    d_step = Decimal(str(step_f))
+                    n = (d_raw / d_step).quantize(Decimal("1"), rounding=ROUND_DOWN)
+                    return float(n * d_step)
+                except Exception:
+                    return float(self.exchange.amount_to_precision(sym, raw))
+
+            qty_prec = _floor_to_step(qty_raw, symbol)
             min_q = float(self.get_symbol_min_amount(symbol) or 0.0)
 
             if qty_prec <= 0:
-                self.queue_notify(f"[ENTRY_BLOCK] {symbol} qty가 0으로 반올림됨 (raw={qty_raw}, min={min_q})")
+                self.queue_notify(f"[ENTRY_BLOCK] {symbol} qty=0 (raw={qty_raw:.6f}, min={min_q})")
                 return
 
             if min_q > 0 and qty_prec < min_q:
                 self.queue_notify(f"[WARN] {symbol} qty<{min_q} → minQty로 보정 (qty:{qty_prec}→{min_q})")
-                qty_prec = float(self.exchange.amount_to_precision(symbol, min_q))
+                qty_prec = _floor_to_step(min_q, symbol)
                 if qty_prec <= 0:
                     self.queue_notify(f"[ENTRY_BLOCK] {symbol} minQty 보정 후에도 qty=0")
                     return
@@ -3743,9 +3756,9 @@ class AsyncTradingBot:
                         except Exception:
                             pass
 
-                    # 리스크 초과 방지: 더 작아지면 축소
+                    # 리스크 초과 방지: 더 작아지면 축소 (_floor_to_step 동일 적용)
                     if qty2 and float(qty2) > 0:
-                        qty2_prec = float(self.exchange.amount_to_precision(symbol, float(qty2)))
+                        qty2_prec = _floor_to_step(float(qty2), symbol)
                         if qty2_prec > 0 and qty2_prec < qty_prec:
                             self.queue_notify(
                                 f"[RISK_CAP] {symbol} qty 조정: {qty_prec}->{qty2_prec} "
