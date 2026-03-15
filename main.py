@@ -188,10 +188,10 @@ class Config:
 
     # [추가 - SuperTrend(5m 엔트리/SL 기준)]
     # SuperTrend (Wilder ATR 기반)
-    ST_PERIOD = 10
-    ST_MULTIPLIER = 2.0
-    ST_COL = 'st_10_2'
-    ST_DIR_COL = 'st_dir_10_2'
+    ST_PERIOD = 14
+    ST_MULTIPLIER = 3.0
+    ST_COL = 'st_14_3'
+    ST_DIR_COL = 'st_dir_14_3'
 
     # [추가 - 공통전략 필터]
     ADX_PERIOD = 14
@@ -965,7 +965,7 @@ class TechnicalAnalyzer:
 
 
     @staticmethod
-    def calculate_supertrend(df, period=10, multiplier=3.0):
+    def calculate_supertrend(df, period=14, multiplier=3.0):
         """
         SuperTrend line + direction
         - df: columns ['high','low','close']
@@ -1093,16 +1093,16 @@ class TechnicalAnalyzer:
             df["atr"] = TechnicalAnalyzer.calculate_atr(df, Config.ATR_PERIOD)
             df["vwap"] = TechnicalAnalyzer.calculate_vwap(df)
 
-            # [추가] SuperTrend (기본: 10,2)
+            # [추가] SuperTrend (기본: 14,3)
             try:
                 st_line, st_dir = TechnicalAnalyzer.calculate_supertrend(
                     df[["high","low","close"]].copy(),
-                    period=getattr(Config, 'ST_PERIOD', 10),
-                    multiplier=getattr(Config, 'ST_MULTIPLIER', 2.0)
+                    period=getattr(Config, 'ST_PERIOD', 14),
+                    multiplier=getattr(Config, 'ST_MULTIPLIER', 3.0)
                 )
                 if st_line is not None and st_dir is not None:
-                    df[getattr(Config, 'ST_COL', 'st_10_2')] = st_line
-                    df[getattr(Config, 'ST_DIR_COL', 'st_dir_10_2')] = st_dir
+                    df[getattr(Config, 'ST_COL', 'st_14_3')] = st_line
+                    df[getattr(Config, 'ST_DIR_COL', 'st_dir_14_3')] = st_dir
                     # [호환] 별칭 컬럼
                     df["st"] = st_line
                     df["st_dir"] = st_dir
@@ -1706,7 +1706,7 @@ class AsyncTradingBot:
 
 
 
-    def _calc_supertrend_dir(self, df, period=10, multiplier=3.0):
+    def _calc_supertrend_dir(self, df, period=14, multiplier=3.0):
         """
         df 컬럼: h, l, c (float)
         반환: (st_line: np.ndarray, st_dir: np.ndarray)
@@ -1852,8 +1852,8 @@ class AsyncTradingBot:
             df5[["h", "l", "c"]]  = df5[["h", "l", "c"]].apply(pd.to_numeric, errors="coerce")
 
             # --- SuperTrend 계산 (필요시 period/multiplier 여기서 조정) ---
-            st15, dir15 = self._calc_supertrend_dir(df15, period=10, multiplier=3.0)
-            st5,  dir5  = self._calc_supertrend_dir(df5,  period=10, multiplier=3.0)
+            st15, dir15 = self._calc_supertrend_dir(df15, period=14, multiplier=3.0)
+            st5,  dir5  = self._calc_supertrend_dir(df5,  period=14, multiplier=3.0)
             if st15 is None or dir15 is None or st5 is None or dir5 is None:
                 return
             if len(dir15) < 3 or len(dir5) < 4:
@@ -3394,7 +3394,7 @@ class AsyncTradingBot:
         - 포지션 방향을 자동 판별 (Buy=LONG, Sell=SHORT)
         - SL:
             - SL 없으면(0) 최초 SL(맵) 또는 recovery_sl로 복구
-            - 5m SuperTrend(10,2) 기반으로 유리한 방향으로만 업데이트
+            - 5m SuperTrend(14,3) 기반으로 유리한 방향으로만 업데이트
               LONG: ST 상방(+1) & low >= ST 일 때, SL = ST - ATR*ATR_SL_5M_K
               SHORT: ST 하방(-1) & high <= ST 일 때, SL = ST + ATR*ATR_SL_5M_K
         - TS:
